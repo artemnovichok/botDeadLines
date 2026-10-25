@@ -34,6 +34,8 @@ class User(Identity, Base):
     telegram_user_id: Mapped[int] = mapped_column(BigInteger, unique=True)
     study_group: Mapped[str | None] = mapped_column(String(32))
     study_group_prompted_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    initial_analysis_choice: Mapped[bool | None] = mapped_column()
+    initial_analysis_decided_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     timezone: Mapped[str] = mapped_column(String(100), default="Europe/Moscow")
     preferred_digest_time: Mapped[time] = mapped_column(default=time(8))
     enabled: Mapped[bool] = mapped_column(default=True)
@@ -61,6 +63,23 @@ class TrackedChat(Identity, Owned, Base):
     last_successful_sync_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     initialization_status: Mapped[str] = mapped_column(String(30), default="pending")
     initial_upper_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    history_after: Mapped[datetime | None] = mapped_column(UTCDateTime())
+
+
+class RecurringDeadline(Identity, Owned, Base):
+    __tablename__ = "recurring_deadlines"
+    __table_args__ = (
+        CheckConstraint("interval_days BETWEEN 1 AND 14", name="recurring_interval_range"),
+    )
+    title: Mapped[str] = mapped_column(String(300))
+    interval_days: Mapped[int] = mapped_column(Integer)
+    first_due_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    timezone: Mapped[str] = mapped_column(String(100))
+    has_time: Mapped[bool] = mapped_column(default=False)
+    enabled: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utcnow)
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+    __mapper_args__ = {"version_id_col": version}
 
 
 class Event(Identity, Owned, Base):
@@ -70,6 +89,10 @@ class Event(Identity, Owned, Base):
         CheckConstraint("confidence >= 0 AND confidence <= 1", name="confidence_range"),
         CheckConstraint("status IN ('active','completed','cancelled')", name="valid_status"),
         Index("ix_events_user_status_due", "user_id", "status", "due_at"),
+        Index("uq_events_recurring_due", "recurring_deadline_id", "due_at", unique=True),
+    )
+    recurring_deadline_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("recurring_deadlines.id"), index=True
     )
     title: Mapped[str] = mapped_column(String(300))
     subject: Mapped[str | None] = mapped_column(String(200))

@@ -2,7 +2,7 @@ from sqlalchemy import text
 
 from deadline_assistant.db.session import Database
 
-SCHEMA_REVISION = "f106_study_group"
+SCHEMA_REVISION = "h108_recurring"
 
 
 async def check_schema(database: Database) -> None:

@@ -161,6 +161,46 @@ async def test_cli_bulk_error_code_keeps_successful_user(configured, database, u
     assert "успешно 1, частично 0, ошибок 1" in capsys.readouterr().out
 
 
+async def test_operator_announces_to_everyone_before_analysis(configured, database, users):
+    for user in users:
+        await prepare(database, user)
+    configured = configured.model_copy(
+        update={"bot_token": SecretStr("123456:synthetic-test-value")}
+    )
+    runtime = Runtime(configured)
+    await runtime.analyzer.close()
+    sync, analyzer = pipeline(runtime.database, configured)
+    runtime.sync, runtime.analyzer = sync, analyzer
+    timeline = []
+
+    async def announce(user_id, text):
+        timeline.append(("notice", user_id))
+
+    original_sync = sync.sync_user
+
+    async def analyze(user_id):
+        timeline.append(("analysis", user_id))
+        return await original_sync(user_id)
+
+    sync.sync_user = AsyncMock(side_effect=analyze)
+    notifier = AsyncMock()
+    notifier.send.side_effect = announce
+    runtime.cycle = CycleService(runtime.database, configured, sync, notifier)
+    args = parser().parse_args(["run-cycle", "--all", "--announce", "Внеплановый тест"])
+    with patch("deadline_assistant.runtime.Runtime", return_value=runtime):
+        assert await execute(args, configured) == 0
+    assert [kind for kind, _ in timeline] == ["notice", "notice", "analysis", "analysis"]
+    assert {user_id for _, user_id in timeline[:2]} == {101, 202}
+
+
+@pytest.mark.parametrize("text,dry_run", [("", False), ("Предупреждение", True)])
+async def test_invalid_announcement_never_starts_runtime(configured, text, dry_run):
+    args = argparse.Namespace(command="run-cycle", announce=text, dry_run=dry_run)
+    with patch("deadline_assistant.runtime.Runtime") as factory:
+        assert await execute(args, configured) == 2
+    factory.assert_not_called()
+
+
 async def test_cli_partial_cycle_reports_incomplete_and_returns_code_four(
     configured, database, users, capsys
 ):

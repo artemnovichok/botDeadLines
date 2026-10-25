@@ -90,10 +90,13 @@ async def test_polling_failure_exits_server_for_restart(database, settings, tmp_
         "LLM_MODEL": "",
     }
     script = """
-from aiogram import Dispatcher
+from aiogram import Bot, Dispatcher
 from deadline_assistant.main import main
+async def commands(*args, **kwargs):
+    return True
 async def fail(*args, **kwargs):
     raise RuntimeError('simulated polling failure')
+Bot.set_my_commands = commands
 Dispatcher.start_polling = fail
 main()
 """

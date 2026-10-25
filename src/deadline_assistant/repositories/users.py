@@ -5,8 +5,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from deadline_assistant.config import Settings
-from deadline_assistant.db.models import User
-from deadline_assistant.domain import EntityNotFound, UserPreferences, normalize_study_group, utcnow
+from deadline_assistant.db.models import TelegramSession, TrackedChat, User
+from deadline_assistant.domain import (
+    EntityNotFound,
+    IntegrationUnavailable,
+    UserPreferences,
+    normalize_study_group,
+    utcnow,
+)
 
 
 class UserRepository:
@@ -62,3 +68,29 @@ class UserRepository:
     async def enabled(self) -> list[User]:
         """Системный обход для планировщика; не используется в пользовательском API."""
         return list(await self.session.scalars(select(User).where(User.enabled.is_(True))))
+
+    async def decide_initial_analysis(self, user_id: UUID, *, analyze: bool) -> bool:
+        user = await self.require(user_id)
+        if user.initial_analysis_choice is not None:
+            return False
+        credential = await self.session.scalar(
+            select(TelegramSession).where(TelegramSession.user_id == user_id)
+        )
+        if credential is None or credential.status != "connected" or not user.study_group:
+            raise IntegrationUnavailable("Сначала подключите Telegram и укажите учебную группу")
+        chats = list(
+            await self.session.scalars(
+                select(TrackedChat).where(
+                    TrackedChat.user_id == user_id, TrackedChat.enabled.is_(True)
+                )
+            )
+        )
+        if not chats:
+            raise IntegrationUnavailable("Сначала выберите чаты в «Мои чаты»")
+        user.initial_analysis_choice = analyze
+        user.initial_analysis_decided_at = utcnow().replace(microsecond=0)
+        if not analyze:
+            for chat in chats:
+                chat.history_after = user.initial_analysis_decided_at
+                chat.initialization_status = "ready"
+        return True

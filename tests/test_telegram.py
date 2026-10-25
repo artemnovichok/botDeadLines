@@ -83,6 +83,37 @@ async def test_initial_history_is_latest_configured_limit(configured):
     assert messages[0].source_url == "https://t.me/c/123/11"
 
 
+async def test_history_after_reads_forward_and_excludes_old_edit_tail(configured):
+    from datetime import timedelta
+
+    cipher = SessionCipher(configured.session_encryption_key.get_secret_value())
+    gateway = TelegramGateway(configured, cipher)
+    cutoff = utcnow()
+    chat = TrackedChat(
+        user_id=uuid4(),
+        telegram_chat_id=-123,
+        title="Группа",
+        peer_metadata={"kind": "chat", "id": 123},
+        last_processed_message_id=0,
+        history_after=cutoff,
+        initialization_status="ready",
+    )
+    client = AsyncMock()
+    client.is_user_authorized.return_value = True
+
+    async def iterate(peer, **kwargs):
+        for i, date in [(1, cutoff - timedelta(days=1)), (2, cutoff + timedelta(seconds=1))]:
+            yield types.Message(id=i, peer_id=types.PeerChat(123), date=date, message="Текст")
+
+    client.iter_messages = MagicMock(side_effect=iterate)
+    gateway.new_client = MagicMock(return_value=client)
+    result = await gateway.fetch(cipher.encrypt(chat.user_id, ""), chat)
+    assert [m.message_id for m in result] == [2]
+    query = client.iter_messages.call_args_list[0].kwargs
+    assert query["reverse"] is True and query["offset_date"] == cutoff - timedelta(seconds=1)
+    assert query["limit"] == configured.sync_batch_size
+
+
 def test_message_urls_use_actual_peer_and_no_invented_basic_group_link():
     private = types.Message(id=5, peer_id=types.PeerChannel(456), date=utcnow(), message="Источник")
     assert TelegramGateway._message(private, -1000000000456).source_url == "https://t.me/c/456/5"

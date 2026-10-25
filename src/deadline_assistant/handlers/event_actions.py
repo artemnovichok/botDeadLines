@@ -11,7 +11,7 @@ from aiogram.types import CallbackQuery, Message
 
 from deadline_assistant.db.models import Event, User
 from deadline_assistant.domain import EntityNotFound, StaleState
-from deadline_assistant.handlers.menus import MENU, PAGE_SIZE, MenuStates, keyboard
+from deadline_assistant.handlers.menus import CANCEL, MENU, PAGE_SIZE, MenuStates, keyboard
 from deadline_assistant.repositories.tenant import TenantRepository, event_data
 from deadline_assistant.services.digest import build_digest, render_date, render_events
 from deadline_assistant.services.sources import show_sources
@@ -32,11 +32,12 @@ def parse_id(value: str) -> UUID:
 def actions(list_id: UUID) -> list[list[tuple[str, str]]]:
     token = short_id(list_id)
     return [
-        [("Редактировать дедлайн", f"el:edit:{token}:0")],
-        [("Завершить задание", f"el:done:{token}:0")],
-        [("Отменить своё исправление", "undo:list")],
-        [("Посмотреть источники", f"el:sources:{token}:0")],
-        [("Обновить сводку", "digest:refresh"), ("Помощь", "help")],
+        [
+            ("Редактировать дедлайн", f"el:edit:{token}:0"),
+            ("Завершить задание", f"el:done:{token}:0"),
+        ],
+        [("Циклические дедлайны", "menu:recurring")],
+        [("Ещё", f"digest:more:{token}")],
     ]
 
 
@@ -107,7 +108,7 @@ def create_event_router(runtime: "Runtime") -> Router:
         await state.set_state(MenuStates.choosing_event)
         panel = await message.answer(
             f"Выберите дедлайн для {labels[action]}. Список {token[:6]}.\n"
-            "Нажмите кнопку или ответьте на это сообщение номером задания. Отмена: /cancel.",
+            "Нажмите кнопку или ответьте на это сообщение номером задания.",
             reply_markup=keyboard(rows),
         )
         await state.set_data(
@@ -143,6 +144,26 @@ def create_event_router(runtime: "Runtime") -> Router:
         await callback.answer()
         await show_list(callback.message, user, state, action, parse_id(token), int(page))
 
+    @router.callback_query(F.data.startswith("digest:more:"))
+    async def more_actions(callback: CallbackQuery, user: User, state: FSMContext) -> None:
+        assert isinstance(callback.message, Message) and callback.data
+        token = callback.data.split(":")[2]
+        async with runtime.database.transaction() as session:
+            await TenantRepository(session, user.id).event_list(parse_id(token))
+        await callback.answer()
+        await state.clear()
+        await callback.message.answer(
+            "Действия с дедлайнами",
+            reply_markup=keyboard(
+                [
+                    [("Посмотреть источники", f"el:sources:{token}:0")],
+                    [("Отменить своё исправление", "undo:list")],
+                    [("Уточнения", "digest:conflicts")],
+                    [("Обновить сводку", "digest:refresh")],
+                ]
+            ),
+        )
+
     @router.callback_query(F.data == "undo:list")
     async def undo_list(callback: CallbackQuery, user: User, state: FSMContext) -> None:
         assert isinstance(callback.message, Message)
@@ -164,13 +185,20 @@ def create_event_router(runtime: "Runtime") -> Router:
         data = await state.get_data()
         async with runtime.database.transaction() as session:
             repo = TenantRepository(session, user.id)
-            event = await repo.listed_event(
-                UUID(data["list_id"]), event_id, require_active=data["action"] != "undo"
-            )
-            if data["action"] == "done":
+            event = await repo.listed_event(UUID(data["list_id"]), event_id, require_active=False)
+            recurring_id = event.recurring_deadline_id
+            if recurring_id is None and data["action"] != "undo" and event.status != "active":
+                raise StaleState("Событие изменилось. Откройте новый список.")
+            if recurring_id is None and data["action"] == "done":
                 await repo.complete(event.id)
-            elif data["action"] == "undo":
+            elif recurring_id is None and data["action"] == "undo":
                 await repo.undo_correction(event.id)
+        if recurring_id is not None:
+            from deadline_assistant.handlers.recurring import show_recurring_card
+
+            await state.clear()
+            await show_recurring_card(message, user, runtime, recurring_id)
+            return
         if data["action"] == "sources":
             await state.clear()
             await show_sources(message, user, runtime, event_id)
@@ -189,7 +217,7 @@ def create_event_router(runtime: "Runtime") -> Router:
             target = short_id(event.id)
             await message.answer(
                 truncate(render_events([event], user.timezone), 2500)
-                + "\nНапишите исправление обычным текстом или выберите поле. Отмена: /cancel.",
+                + "\nНапишите исправление обычным текстом или выберите поле.",
                 reply_markup=keyboard(
                     [
                         [
@@ -222,14 +250,15 @@ def create_event_router(runtime: "Runtime") -> Router:
             "number_prompt"
         ):
             await message.answer(
-                "Ответьте номером именно на сообщение со списком или нажмите кнопку задания."
+                "Ответьте номером именно на сообщение со списком или нажмите кнопку задания.",
+                reply_markup=CANCEL,
             )
             return
         text = (message.text or "").strip()
         async with runtime.database.transaction() as session:
             listing = await TenantRepository(session, user.id).event_list(UUID(data["list_id"]))
             if not text.isdigit() or not 1 <= int(text) <= len(listing.entries):
-                await message.answer("Такого номера в показанном списке нет.")
+                await message.answer("Такого номера в показанном списке нет.", reply_markup=CANCEL)
                 return
             event_id = UUID(listing.entries[int(text) - 1]["id"])
         await select(message, user, state, event_id)
@@ -249,9 +278,10 @@ def create_event_router(runtime: "Runtime") -> Router:
         await state.set_state(MenuStates.editing_value)
         await callback.answer()
         await callback.message.answer(
-            "Введите срок ДД.ММ.ГГГГ ЧЧ:ММ или ДД.ММ.ГГГГ. «-» убирает срок. Отмена: /cancel."
+            "Введите срок ДД.ММ.ГГГГ ЧЧ:ММ или ДД.ММ.ГГГГ. «-» убирает срок."
             if name == "due_at"
-            else "Введите новое значение. «-» очищает поле. Отмена: /cancel."
+            else "Введите новое значение. «-» очищает поле.",
+            reply_markup=CANCEL,
         )
 
     @router.message(Command("status"))
@@ -287,13 +317,5 @@ def create_event_router(runtime: "Runtime") -> Router:
         assert isinstance(callback.message, Message)
         await callback.answer()
         await refresh(callback.message, user, state)
-
-    @router.callback_query(F.data == "help")
-    async def help_callback(callback: CallbackQuery) -> None:
-        from deadline_assistant.handlers.bot import HELP
-
-        assert isinstance(callback.message, Message)
-        await callback.answer()
-        await callback.message.answer(HELP)
 
     return router

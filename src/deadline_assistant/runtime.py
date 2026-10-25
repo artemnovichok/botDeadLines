@@ -6,6 +6,7 @@ from typing import Any
 import structlog
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.types import BotCommand
 from sqlalchemy import select
 
 from deadline_assistant.config import Settings
@@ -13,7 +14,7 @@ from deadline_assistant.db.models import AuthLink, User
 from deadline_assistant.db.schema import check_schema
 from deadline_assistant.db.session import Database
 from deadline_assistant.handlers.bot import BotNotifier, create_dispatcher
-from deadline_assistant.handlers.menus import MENU, keyboard
+from deadline_assistant.handlers.menus import keyboard
 from deadline_assistant.integrations.crypto import SessionCipher
 from deadline_assistant.integrations.llm import OpenAIAnalyzer
 from deadline_assistant.integrations.telegram import TelegramGateway
@@ -86,6 +87,10 @@ class Runtime:
             await check_schema(self.database)
             async with self.database.transaction() as session:
                 await session.execute(select(User.id).limit(1))
+            if self.bot:
+                await self.bot.set_my_commands(
+                    [BotCommand(command="start", description="Открыть меню")]
+                )
             await self.scheduler.start()
             await self.jobs.start()
             self.scheduler.scheduler.add_job(
@@ -155,12 +160,21 @@ class Runtime:
         )
 
     async def _connected(self, user: User) -> None:
+        from deadline_assistant.handlers.menus import account_menu, ask_study_group
+
         assert self.bot is not None
-        await self.bot.send_message(
+        message = await self.bot.send_message(
             user.telegram_user_id,
-            "Аккаунт успешно подключён. Нажмите «Мои чаты» и выберите источники.",
-            reply_markup=MENU,
+            "Аккаунт успешно подключён. "
+            + (
+                "Нажмите «Мои чаты» и выберите источники."
+                if user.study_group
+                else "Осталось указать учебную группу."
+            ),
+            reply_markup=await account_menu(user, self),
         )
+        if not user.study_group:
+            await ask_study_group(message.as_(self.bot), user, self)
 
     async def _revocation_unconfirmed(self, user: User) -> None:
         assert self.bot is not None

@@ -200,7 +200,7 @@ async def test_three_variants_dedup_stale_owner_and_fast_resolution(database, us
             await TenantRepository(session, users[1].id).resolve_conflict(conflict.id, 3, version)
     async with database.transaction() as session:
         cards, summary = await build_digest(
-            TenantRepository(session, users[0].id), users[0].timezone
+            TenantRepository(session, users[0].id), users[0].timezone, include_conflict_cards=True
         )
         assert "Дата требует подтверждения" in summary and "3 ноября 2026" in summary
         assert len([b for b in cards[0].buttons if b[1].startswith("cf:")]) == 4
@@ -231,7 +231,7 @@ async def test_stale_conflict_cannot_overwrite_manual_change(database, users):
             )
     async with database.transaction() as session:
         repo = TenantRepository(session, users[0].id)
-        cards, _ = await build_digest(repo, users[0].timezone)
+        cards, _ = await build_digest(repo, users[0].timezone, include_conflict_cards=True)
         assert cards[0].buttons[0][0] == "Проверить снова"
         assert (await repo.event(event.id)).title == "Свежая ручная правка"
 
@@ -530,17 +530,20 @@ async def test_teacher_confirmation_then_student_rumour_keeps_both_sources(datab
     async with database.transaction() as session:
         repo = TenantRepository(session, users[0].id)
         assert (await repo.event(memory.id)).due_at == first.due_at
-        cards, summary = await build_digest(repo, users[0].timezone)
+        cards, summary = await build_digest(repo, users[0].timezone, include_conflict_cards=True)
         assert "7 ноября 2026" in summary and "12 ноября 2026" in summary
         assert "Мне кажется" not in cards[0].text
         saved_sources = await repo.sources(memory.id, include_conflicts=True)
         assert any("Мне кажется" in (s.original_text or "") for s in saved_sources)
 
 
-async def test_unconfirmed_conflict_does_not_block_other_events(database, users, settings):
+async def test_unconfirmed_conflict_does_not_block_other_events(
+    database, connected_users, settings
+):
     from deadline_assistant.services.retention import RetentionService
     from deadline_assistant.services.scheduler import SchedulerService
 
+    users = connected_users
     async with database.transaction() as session:
         repo = TenantRepository(session, users[0].id)
         await repo.save_session("encrypted")
@@ -554,11 +557,13 @@ async def test_unconfirmed_conflict_does_not_block_other_events(database, users,
         database, settings, AsyncMock(), notifier, RetentionService(database, settings)
     )
     await scheduler.tick(datetime.fromisoformat("2026-10-20T09:00:00+03:00"))
-    notifier.send_conflict.assert_awaited_once()
+    notifier.send_conflict.assert_not_awaited()
     summary = next(c.args[1] for c in notifier.send.await_args_list if c.args[0] == 101)
-    assert "Подтверждённая лабораторная" in summary and "карточку конфликта" in summary
-    deliveries = [c[0] for c in notifier.mock_calls if c[0] in {"send", "send_conflict"}]
-    assert deliveries[0] == "send_conflict"
+    assert "Подтверждённая лабораторная" in summary and "НЕОПРЕДЕЛЁННОСТИ" in summary
+    deliveries = [
+        c[0] for c in notifier.mock_calls if c[0] in {"send", "send_conflict"} and c.args[0] == 101
+    ]
+    assert deliveries == ["send"]
 
 
 async def test_pending_correction_is_retried_even_without_new_chat_messages(
@@ -664,7 +669,7 @@ async def test_conflict_choices_expose_conditions_place_and_grace(database, user
             ),
             [source.id],
         )
-        cards, _ = await build_digest(repo, "Europe/Moscow")
+        cards, _ = await build_digest(repo, "Europe/Moscow", include_conflict_cards=True)
         for text in ("Необязательно", "Аудитория 301", "Для оценки 10", "Минус балл", "18.11.2026"):
             assert text in cards[0].text
 
@@ -697,7 +702,7 @@ async def test_uncertain_new_event_is_marked_for_clarification(database, users):
     await apply(database, users[0], [operation], [msg()], context)
     async with database.transaction() as session:
         _, summary = await build_digest(TenantRepository(session, users[0].id), "Europe/Moscow")
-    assert "Дата требует подтверждения" in summary
+    assert "НЕОПРЕДЕЛЁННОСТИ" in summary and "Дата уточняется" in summary
 
 
 @pytest.mark.parametrize("grace", [None, "2026-11-01T00:00:00+03:00"])

@@ -44,6 +44,8 @@ async def test_only_connected_user_receives_digest(database, users, settings):
 
     async with database.transaction() as session:
         await TenantRepository(session, users[0].id).save_session("encrypted")
+        user = await UserRepository(session).set_study_group(users[0].id, "БПИ267")
+        user.initial_analysis_choice = False
     notifier = AsyncMock()
     scheduler = SchedulerService(
         database, settings, AsyncMock(), notifier, RetentionService(database, settings)
@@ -284,6 +286,7 @@ async def test_night_failure_keeps_checkpoint_and_morning_digest(
     scheduler = SchedulerService(
         database, configured, sync, notifier, RetentionService(database, configured)
     )
+    await scheduler.tick(datetime.fromisoformat("2026-10-20T02:10:00+03:00"))
     await scheduler.tick(datetime(2026, 10, 20, 6, tzinfo=UTC))
     summary = next(call.args[1] for call in notifier.send.await_args_list if call.args[0] == 101)
     assert "Последний достоверный дедлайн" in summary and "устаревшими" in summary
@@ -319,7 +322,7 @@ async def test_empty_night_still_sends_morning_without_llm(database, connected_u
     )
 
 
-async def test_night_catchup_before_next_night_covers_checkpoint_once(
+async def test_sync_only_runs_in_night_window_once_per_local_date(
     database, connected_users, configured
 ):
 
@@ -333,10 +336,33 @@ async def test_night_catchup_before_next_night_covers_checkpoint_once(
     )
     now = datetime.fromisoformat("2026-10-21T01:00:00+03:00")
     await scheduler.tick(now)
+    sync.sync_user.assert_not_awaited()
+    await scheduler.tick(datetime.fromisoformat("2026-10-21T14:00:00+03:00"))
+    sync.sync_user.assert_not_awaited()
+    now = datetime.fromisoformat("2026-10-22T02:10:00+03:00")
+    await scheduler.tick(now)
     await scheduler.tick(now)
     sync.sync_user.assert_awaited_once_with(connected_users[0].id)
     async with database.transaction() as session:
         row = await session.scalar(
             select(ScheduledDelivery).where(ScheduledDelivery.kind == "sync")
         )
-        assert row.local_date.isoformat() == "2026-10-20" and row.status == "sent"
+        assert row.local_date.isoformat() == "2026-10-22" and row.status == "sent"
+
+
+@pytest.mark.parametrize("group,choice", [(None, True), ("БПИ267", None)])
+async def test_schedule_waits_for_onboarding(database, users, configured, group, choice):
+    async with database.transaction() as session:
+        user = await UserRepository(session).require(users[0].id)
+        user.study_group, user.initial_analysis_choice = group, choice
+        repo = TenantRepository(session, user.id)
+        await repo.save_session("encrypted")
+        await repo.track(-1001, "Группа", {"kind": "chat", "id": 1})
+    sync, notifier = AsyncMock(), AsyncMock()
+    scheduler = SchedulerService(
+        database, configured, sync, notifier, RetentionService(database, configured)
+    )
+    await scheduler.tick(datetime.fromisoformat("2026-10-21T02:10:00+03:00"))
+    await scheduler.tick(datetime.fromisoformat("2026-10-21T08:00:00+03:00"))
+    sync.sync_user.assert_not_awaited()
+    notifier.send.assert_not_awaited()

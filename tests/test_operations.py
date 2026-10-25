@@ -24,6 +24,7 @@ from deadline_assistant.domain import (
     utcnow,
 )
 from deadline_assistant.repositories.tenant import TenantRepository
+from deadline_assistant.repositories.users import UserRepository
 from deadline_assistant.services.accounts import AccountService
 from deadline_assistant.services.analysis import OperationApplier
 from deadline_assistant.services.coordination import JobBusy
@@ -34,6 +35,9 @@ from deadline_assistant.services.sync import SyncService
 
 async def prepare(database, user, chat_id=-1001):
     async with database.transaction() as session:
+        stored = await UserRepository(session).set_study_group(user.id, "БПИ267")
+        stored.initial_analysis_choice = True
+        stored.initial_analysis_decided_at = utcnow()
         repo = TenantRepository(session, user.id)
         await repo.save_session("encrypted")
         return await repo.track(chat_id, "Учебный чат", {"kind": "chat", "id": abs(chat_id)})

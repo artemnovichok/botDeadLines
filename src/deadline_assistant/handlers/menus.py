@@ -15,9 +15,8 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
     Message,
-    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 
 from deadline_assistant.db.models import User
@@ -35,22 +34,6 @@ from deadline_assistant.services.jobs import render_run
 if TYPE_CHECKING:
     from deadline_assistant.runtime import Runtime
 
-MENU = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="Мои дедлайны"), KeyboardButton(text="Мои чаты")],
-        [KeyboardButton(text="Редактировать дедлайн"), KeyboardButton(text="Настройки")],
-    ],
-    resize_keyboard=True,
-    is_persistent=True,
-)
-CONNECT_MENU = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="Подключить аккаунт")],
-        [KeyboardButton(text="Настройки"), KeyboardButton(text="Помощь")],
-    ],
-    resize_keyboard=True,
-    is_persistent=True,
-)
 PAGE_SIZE = 8
 
 
@@ -65,7 +48,9 @@ class MenuStates(StatesGroup):
     editing_value = State()
 
 
-def keyboard(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
+def keyboard(rows: list[list[tuple[str, str]]], *, home: bool = True) -> InlineKeyboardMarkup:
+    if home:
+        rows = [*rows, [("Главное меню", "menu:home")]]
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=label, callback_data=value) for label, value in row]
@@ -74,13 +59,57 @@ def keyboard(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
     )
 
 
-FIRST_ANALYSIS = keyboard([[("Первый анализ", "analysis:first")]])
+MENU = keyboard(
+    [
+        [("Мои дедлайны", "menu:deadlines"), ("Мои чаты", "menu:chats")],
+        [("Циклические дедлайны", "menu:recurring")],
+        [("Настройки", "menu:settings")],
+    ],
+    home=False,
+)
+CONNECT_MENU = keyboard([[("Подключить аккаунт", "account:connect")]], home=False)
+CANCEL = keyboard([[("Отмена", "menu:cancel")]], home=False)
+FIRST_ANALYSIS = keyboard([[("Да", "analysis:first"), ("Нет", "analysis:skip")]], home=False)
 
 
-async def account_menu(user: User, runtime: "Runtime") -> ReplyKeyboardMarkup:
+async def account_menu(user: User, runtime: "Runtime") -> InlineKeyboardMarkup | None:
     async with runtime.database.transaction() as session:
         credential = await TenantRepository(session, user.id).telegram_session()
-    return MENU if credential and credential.status == "connected" else CONNECT_MENU
+    if not credential or credential.status != "connected":
+        return CONNECT_MENU
+    return MENU if user.study_group else None
+
+
+async def ask_study_group(
+    message: Message, user: User, runtime: "Runtime", state: FSMContext | None = None
+) -> None:
+    async with runtime.database.transaction() as session:
+        stored = await UserRepository(session).require(user.id)
+        stored.study_group_prompted_at = stored.study_group_prompted_at or utcnow()
+    if state is not None:
+        await state.set_state(MenuStates.study_group)
+    await message.answer(
+        "Укажите вашу учебную группу, например БПИ267. "
+        "Я сохраню её и буду выбирать подходящие вам даты из распределений по группам.\n"
+        "Это обязательный шаг: после него откроются чаты и настройки расписания. "
+        "Изменить группу позже можно в настройках.",
+        reply_markup=CANCEL,
+    )
+
+
+async def offer_first_analysis(message: Message, user: User, runtime: "Runtime") -> None:
+    if user.initial_analysis_choice is not None:
+        return
+    await message.answer(
+        "Проанализировать старые сообщения выбранных чатов?\n"
+        f"«Да» — один раз разобрать до {runtime.settings.initial_message_limit} последних "
+        "доступных сообщений каждого выбранного чата и собрать дедлайны. "
+        f"Учитываются сообщения за последние {runtime.settings.message_max_age_days} дней.\n"
+        "«Нет» — начать отслеживание с текущего момента без старой переписки.\n"
+        "Выбор доступен один раз. Затем анализ выполняется только ночью, "
+        "а сводка приходит утром.",
+        reply_markup=FIRST_ANALYSIS,
+    )
 
 
 async def connection_link(message: Message, user: User, runtime: "Runtime") -> None:
@@ -101,7 +130,7 @@ async def connection_link(message: Message, user: User, runtime: "Runtime") -> N
         # and keeps the one-time token out of link previews.
         await message.answer(
             "Подключите тот же Telegram-аккаунт, с которого вы открыли бота.\n\n"
-            "Скопируйте ссылку целиком и откройте в браузере на Mac, где запущен бот:\n"
+            "Скопируйте ссылку целиком и откройте в браузере на компьютере, где запущен бот:\n"
             f"<code>{escape(url)}</code>\n\n"
             "Ссылка одноразовая и действует 10 минут. Не пересылайте её. "
             "Коды и пароль вводятся только на защищённой странице.",
@@ -215,9 +244,7 @@ def create_menu_router(runtime: "Runtime") -> Router:
                 [
                     [("Учебная группа", "settings:group")],
                     [("Часовой пояс", "settings:timezone"), ("Время сводки", "settings:time")],
-                    [("Подключения", "connections:0"), ("Проверить доступ", "settings:check")],
-                    [("Переподключить аккаунт", "account:connect")],
-                    [("Отключить аккаунт", "account:disconnect")],
+                    [("Аккаунт", "account:settings")],
                 ]
             ),
         )
@@ -246,37 +273,51 @@ def create_menu_router(runtime: "Runtime") -> Router:
         )
 
     async def ask_group(message: Message, user: User, state: FSMContext) -> None:
-        async with runtime.database.transaction() as session:
-            stored = await UserRepository(session).require(user.id)
-            stored.study_group_prompted_at = stored.study_group_prompted_at or utcnow()
-        await state.set_state(MenuStates.study_group)
-        await message.answer(
-            "Укажите вашу учебную группу, например БПИ267. "
-            "Я сохраню её и буду выбирать подходящие вам даты из распределений по группам.\n"
-            "Изменить группу позже: /group. Пропустить: /cancel.",
-        )
+        await ask_study_group(message, user, runtime, state)
 
-    async def continue_onboarding(message: Message, user: User) -> None:
-        if await account_menu(user, runtime) is MENU:
-            await message.answer("Аккаунт подключён. Откройте «Мои чаты» в нижнем меню.")
-        else:
+    async def continue_onboarding(message: Message, user: User, state: FSMContext) -> None:
+        menu = await account_menu(user, runtime)
+        if menu is CONNECT_MENU:
             await connection_link(message, user, runtime)
+        elif not user.study_group:
+            await ask_group(message, user, state)
+        else:
+            await message.answer(
+                "Настройка аккаунта завершена. Откройте «Мои чаты» и выберите источники. "
+                "В «Настройках» можно задать время утренней сводки.",
+                reply_markup=MENU,
+            )
+            if user.initial_analysis_choice is None and any(
+                chat.enabled for chat in await runtime.accounts.connections(user.id)
+            ):
+                await offer_first_analysis(message, user, runtime)
 
     @router.message(Command("start"))
     async def start(message: Message, user: User, state: FSMContext) -> None:
         await state.clear()
-        menu = await account_menu(user, runtime)
         await message.answer(
             "Deadline Assistant находит дедлайны в выбранных вами чатах. "
-            "Подключите Telegram, выберите чаты и запустите первый анализ. "
+            "Сначала подключите Telegram и укажите учебную группу, затем выберите чаты. "
             "Никогда не присылайте боту коды входа и пароль 2FA.",
-            reply_markup=menu,
+            reply_markup=ReplyKeyboardRemove(),
         )
-        if user.study_group is None and user.study_group_prompted_at is None:
-            await state.update_data(group_onboarding=True)
-            await ask_group(message, user, state)
+        await continue_onboarding(message, user, state)
+
+    @router.callback_query(
+        F.data.in_({"menu:home", "menu:deadlines", "menu:chats", "menu:settings"})
+    )
+    async def navigate(callback: CallbackQuery, user: User, state: FSMContext) -> None:
+        assert isinstance(callback.message, Message)
+        await callback.answer()
+        await state.clear()
+        if callback.data == "menu:deadlines":
+            await deadlines(callback.message, user, state)
+        elif callback.data == "menu:chats":
+            await chats(callback.message, user, state)
+        elif callback.data == "menu:settings":
+            await show_settings(callback.message, user)
         else:
-            await continue_onboarding(message, user)
+            await continue_onboarding(callback.message, user, state)
 
     @router.message(Command("group"))
     async def group_command(message: Message, user: User, state: FSMContext) -> None:
@@ -285,6 +326,7 @@ def create_menu_router(runtime: "Runtime") -> Router:
         if len(parts) == 1:
             await ask_group(message, user, state)
             return
+        onboarding = user.study_group is None
         async with runtime.database.transaction() as session:
             saved = await UserRepository(session).set_study_group(user.id, parts[1])
         await message.answer(
@@ -292,6 +334,8 @@ def create_menu_router(runtime: "Runtime") -> Router:
             "Следующий анализ будет учитывать вашу группу.",
             reply_markup=await account_menu(saved, runtime),
         )
+        if onboarding:
+            await continue_onboarding(message, saved, state)
 
     @router.message(Command("connect"))
     @router.message(F.text == "Подключить аккаунт")
@@ -302,13 +346,12 @@ def create_menu_router(runtime: "Runtime") -> Router:
     @router.message(Command("cancel"))
     @router.message(F.text == "Отмена")
     async def cancel_menu(message: Message, user: User, state: FSMContext) -> None:
-        onboarding = (await state.get_data()).get("group_onboarding")
         await state.clear()
         await message.answer(
             "Изменения в меню отменены.", reply_markup=await account_menu(user, runtime)
         )
-        if onboarding:
-            await continue_onboarding(message, user)
+        if not user.study_group:
+            await continue_onboarding(message, user, state)
 
     @router.message(F.text == "Мои дедлайны")
     async def deadlines(message: Message, user: User, state: FSMContext) -> None:
@@ -338,21 +381,11 @@ def create_menu_router(runtime: "Runtime") -> Router:
                 user = await UserRepository(session).preferences(user.id, preferences)
         await show_settings(message, user)
 
-    @router.message(Command("sync"))
-    async def sync(message: Message, user: User) -> None:
-        queued = await runtime.jobs.enqueue(user.id)
-        await message.answer(
-            "Анализ запущен в фоне. Пришлю результат или промежуточную сводку. "
-            "Прогресс: /status. Остановить: /stop_sync."
-            if queued
-            else "Анализ уже выполняется. Прогресс: /status. Остановить: /stop_sync."
-        )
-
     @router.message(Command("stop_sync"))
     async def stop_sync(message: Message, user: User) -> None:
         stopped = await runtime.jobs.stop(user.id)
         await message.answer(
-            "Анализ остановлен. Сохранённые события остались; продолжить: /sync. "
+            "Анализ остановлен. Сохранённые события остались; продолжение — ночью. "
             "Незавершённый запрос мог быть оплачен провайдером."
             if stopped
             else "Активного фонового анализа нет."
@@ -399,11 +432,12 @@ def create_menu_router(runtime: "Runtime") -> Router:
         await callback.message.answer(text)
 
     @router.callback_query(F.data == "menu:cancel")
-    async def cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    async def cancel_callback(callback: CallbackQuery, user: User, state: FSMContext) -> None:
         assert isinstance(callback.message, Message)
         await state.clear()
         await callback.answer("Изменения отменены")
         await callback.message.edit_reply_markup(reply_markup=None)
+        await continue_onboarding(callback.message, user, state)
 
     @router.callback_query(F.data.startswith("ch:"))
     async def choose_chat(callback: CallbackQuery, user: User, state: FSMContext) -> None:
@@ -436,7 +470,7 @@ def create_menu_router(runtime: "Runtime") -> Router:
             page = max(0, min(int(parts[3]), len(data["catalog"]) // PAGE_SIZE))
         elif action == "search":
             await state.set_state(MenuStates.searching_chats)
-            await callback.message.answer("Введите часть названия чата. Отмена: /cancel.")
+            await callback.message.answer("Введите часть названия чата.", reply_markup=CANCEL)
             return
         elif action == "all":
             data["query"], page = "", 0
@@ -448,13 +482,16 @@ def create_menu_router(runtime: "Runtime") -> Router:
             await state.clear()
             await callback.message.edit_reply_markup(reply_markup=None)
             await callback.message.answer(
-                f"Выбор сохранён. Чатов подключено: {count}.\n"
-                f"Первый анализ соберёт до {runtime.settings.initial_message_limit} "
-                "последних доступных сообщений в каждом новом чате; "
-                "в анализ попадут сообщения за последние "
-                f"{runtime.settings.message_max_age_days} дней.",
-                reply_markup=FIRST_ANALYSIS if count else None,
+                f"Выбор сохранён. Чатов подключено: {count}.", reply_markup=MENU
             )
+            if count and user.initial_analysis_choice is None:
+                await offer_first_analysis(callback.message, user, runtime)
+            elif count:
+                await callback.message.answer(
+                    "Следующий анализ — ночью, сводка — утром. "
+                    "Для добавленных чатов отслеживаются сообщения с момента подключения.",
+                    reply_markup=MENU,
+                )
             return
         else:
             raise EntityNotFound
@@ -468,10 +505,28 @@ def create_menu_router(runtime: "Runtime") -> Router:
     async def first_analysis(callback: CallbackQuery, user: User) -> None:
         assert isinstance(callback.message, Message)
         queued = await runtime.jobs.enqueue(user.id, initial=True)
-        await callback.answer("Анализ запущен" if queued else "Анализ уже выполняется")
+        await callback.answer(
+            "Анализ запущен" if queued else "Первый анализ уже выбран или анализ выполняется"
+        )
+        await callback.message.edit_reply_markup(reply_markup=None)
         if queued:
             await callback.message.answer(
-                "Первый анализ выполняется в фоне. Пришлю число сообщений и найденных событий."
+                "Первый анализ выполняется в фоне. Пришлю число сообщений и найденных событий.",
+                reply_markup=MENU,
+            )
+
+    @router.callback_query(F.data == "analysis:skip")
+    async def skip_first_analysis(callback: CallbackQuery, user: User) -> None:
+        assert isinstance(callback.message, Message)
+        async with runtime.database.transaction() as session:
+            chosen = await UserRepository(session).decide_initial_analysis(user.id, analyze=False)
+        await callback.answer("Выбор сохранён" if chosen else "Выбор первого анализа уже сделан")
+        await callback.message.edit_reply_markup(reply_markup=None)
+        if chosen:
+            await callback.message.answer(
+                "Старая переписка пропущена. Новые сообщения отслеживаются с текущего момента. "
+                "Анализ — ночью, сводка — утром.",
+                reply_markup=MENU,
             )
 
     @router.callback_query(F.data.startswith("connections:"))
@@ -501,12 +556,14 @@ def create_menu_router(runtime: "Runtime") -> Router:
             await state.set_state(MenuStates.timezone)
             await callback.message.answer(
                 "Введите часовой пояс IANA, например Europe/Moscow, Europe/Berlin "
-                "или Asia/Yekaterinburg. Отмена: /cancel."
+                "или Asia/Yekaterinburg.",
+                reply_markup=CANCEL,
             )
         elif action == "time":
             await state.set_state(MenuStates.digest_time)
             await callback.message.answer(
-                f"Введите время утренней сводки ЧЧ:ММ в поясе {user.timezone}. Отмена: /cancel."
+                f"Введите время утренней сводки ЧЧ:ММ в поясе {user.timezone}.",
+                reply_markup=CANCEL,
             )
         elif action == "check":
             dialogs = {d["id"]: d for d in await runtime.accounts.dialogs(user.id)}
@@ -524,7 +581,20 @@ def create_menu_router(runtime: "Runtime") -> Router:
     async def account(callback: CallbackQuery, user: User, state: FSMContext) -> None:
         assert isinstance(callback.message, Message) and callback.data
         await callback.answer()
-        if callback.data == "account:connect":
+        if callback.data == "account:settings":
+            await state.clear()
+            await callback.message.answer(
+                "Управление аккаунтом Telegram",
+                reply_markup=keyboard(
+                    [
+                        [("Проверить доступ", "settings:check")],
+                        [("Переподключить аккаунт", "account:connect")],
+                        [("Отключить аккаунт", "account:disconnect")],
+                        [("Удалить мои данные", "privacy:ask")],
+                    ]
+                ),
+            )
+        elif callback.data == "account:connect":
             await state.clear()
             await connection_link(callback.message, user, runtime)
         elif callback.data == "account:disconnect":
@@ -566,7 +636,7 @@ def create_menu_router(runtime: "Runtime") -> Router:
     async def search(message: Message, state: FSMContext) -> None:
         query = (message.text or "").strip()
         if len(query) > 100:
-            await message.answer("Введите до 100 символов.")
+            await message.answer("Введите до 100 символов.", reply_markup=CANCEL)
             return
         data = await state.update_data(query=query, page=0)
         await state.set_state(MenuStates.choosing_chats)
@@ -586,9 +656,9 @@ def create_menu_router(runtime: "Runtime") -> Router:
         try:
             group = normalize_study_group(message.text or "")
         except ValueError as exc:
-            await message.answer(str(exc))
+            await message.answer(str(exc), reply_markup=CANCEL)
             return
-        onboarding = (await state.get_data()).get("group_onboarding")
+        onboarding = user.study_group is None
         async with runtime.database.transaction() as session:
             user = await UserRepository(session).set_study_group(user.id, group)
         await state.clear()
@@ -598,7 +668,7 @@ def create_menu_router(runtime: "Runtime") -> Router:
             reply_markup=await account_menu(user, runtime),
         )
         if onboarding:
-            await continue_onboarding(message, user)
+            await continue_onboarding(message, user, state)
 
     @router.message(MenuStates.timezone, F.text, ~F.text.startswith("/"))
     @router.message(MenuStates.digest_time, F.text, ~F.text.startswith("/"))
@@ -675,5 +745,13 @@ def create_menu_router(runtime: "Runtime") -> Router:
     @router.callback_query()
     async def stale_callback(callback: CallbackQuery) -> None:
         await callback.answer("Меню устарело. Откройте нужный раздел заново.", show_alert=True)
+
+    @router.message(F.text.startswith("/"))
+    async def unknown_command(message: Message, user: User, state: FSMContext) -> None:
+        await state.clear()
+        await message.answer(
+            "Откройте нужный раздел кнопками под сообщением.",
+            reply_markup=await account_menu(user, runtime),
+        )
 
     return router

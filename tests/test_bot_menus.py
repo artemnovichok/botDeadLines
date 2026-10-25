@@ -1,7 +1,7 @@
 from collections.abc import AsyncGenerator
 from itertools import count
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from aiogram.client.session.base import BaseSession
@@ -11,8 +11,17 @@ from aiogram.methods import (
     EditMessageText,
     GetMe,
     SendMessage,
+    SetMyCommands,
 )
-from aiogram.types import CallbackQuery, Chat, InlineKeyboardMarkup, Message, Update
+from aiogram.types import (
+    CallbackQuery,
+    Chat,
+    InlineKeyboardMarkup,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from aiogram.types import User as TelegramUser
 from pydantic import SecretStr
 
@@ -20,6 +29,7 @@ from deadline_assistant.config import Settings
 from deadline_assistant.domain import EventData, utcnow
 from deadline_assistant.handlers.menus import MenuStates
 from deadline_assistant.repositories.tenant import TenantRepository
+from deadline_assistant.repositories.users import UserRepository
 from deadline_assistant.runtime import Runtime
 
 IDS = count(1)
@@ -38,7 +48,7 @@ class RecordingSession(BaseSession):
 
     async def make_request(self, bot, method, timeout=None) -> Any:  # noqa: ASYNC109
         self.calls.append(method)
-        if isinstance(method, AnswerCallbackQuery):
+        if isinstance(method, (AnswerCallbackQuery, SetMyCommands)):
             return True
         if isinstance(method, GetMe):
             return TelegramUser(
@@ -167,6 +177,7 @@ async def connected_bot_runtime(bot_runtime, database, users):
     async with database.transaction() as session:
         for user in users:
             await TenantRepository(session, user.id).save_session("encrypted")
+            await UserRepository(session).set_study_group(user.id, "БПИ267")
     return bot_runtime
 
 
@@ -177,19 +188,8 @@ async def test_start_private_keyboard_and_secure_connect_url(bot_runtime):
     await send(runtime, "/start")
     messages = [m for m in recording.calls if isinstance(m, SendMessage)]
     assert len(messages) == 2
-    keyboard = messages[0].reply_markup
-    assert keyboard.is_persistent
-    assert {b.text for row in keyboard.keyboard for b in row} == {
-        "Подключить аккаунт",
-        "Настройки",
-        "Помощь",
-    }
-    assert "БПИ267" in messages[1].text
-    await send(runtime, "БПИ267")
-    assert any(
-        isinstance(call, SendMessage) and "сохранена: БПИ267" in call.text
-        for call in recording.calls
-    )
+    assert isinstance(messages[0].reply_markup, ReplyKeyboardRemove)
+    assert not any("Укажите вашу учебную группу" in m.text for m in messages)
     url = last_panel(recording).reply_markup.inline_keyboard[0][0].url
     assert "/connect#token=" in url and "user_id" not in url
 
@@ -206,7 +206,7 @@ async def test_local_connect_returns_copyable_link_without_url_button(bot_runtim
     panel = last_panel(recording)
     assert panel.reply_markup is None
     assert panel.parse_mode == "HTML"
-    assert "на Mac" in panel.text
+    assert "на компьютере, где запущен бот" in panel.text
     url = unescape(panel.text.split("<code>")[1].split("</code>")[0])
     assert url.startswith(base_url + "/connect#token=")
     browser, csrf = await runtime.auth.exchange(url.split("#token=")[1])
@@ -249,11 +249,9 @@ async def test_unconnected_account_cannot_access_deadlines(bot_runtime, database
         )
     await send(runtime, command)
     panel = last_panel(recording)
-    assert panel.text == "Сначала подключите аккаунт: /connect"
-    assert {b.text for row in panel.reply_markup.keyboard for b in row} == {
+    assert panel.text == "Сначала подключите аккаунт Telegram."
+    assert {b.text for row in panel.reply_markup.inline_keyboard for b in row} == {
         "Подключить аккаунт",
-        "Настройки",
-        "Помощь",
     }
     assert not runtime.jobs.tasks
     runtime.gateway.dialogs.assert_not_awaited()
@@ -274,26 +272,30 @@ async def test_inactive_session_blocks_old_actions(connected_bot_runtime, databa
         (await TenantRepository(session, users[0].id).telegram_session()).status = status
     recording.calls.clear()
     await click(runtime, action)
-    assert last_panel(recording).text == "Сначала подключите аккаунт: /connect"
+    assert last_panel(recording).text == "Сначала подключите аккаунт Telegram."
     assert any(isinstance(c, AnswerCallbackQuery) and c.show_alert for c in recording.calls)
     async with database.transaction() as session:
         assert (await TenantRepository(session, users[0].id).event(event.id)).status == "active"
     recording.calls.clear()
     await send(runtime, "/events")
-    assert last_panel(recording).text == "Сначала подключите аккаунт: /connect"
+    assert last_panel(recording).text == "Сначала подключите аккаунт Telegram."
 
 
-async def test_onboarding_settings_cancel_and_connect_stay_available(bot_runtime):
+async def test_settings_require_connection_and_group(bot_runtime, database, users):
     runtime, recording = bot_runtime
     await send(runtime, "Настройки")
-    assert "не подключён" in last_panel(recording).text
-    await click(runtime, button(last_panel(recording), "Часовой пояс").callback_data)
-    await send(runtime, "Asia/Yekaterinburg")
-    assert "Asia/Yekaterinburg" in last_panel(recording).text
+    assert "Сначала подключите аккаунт" in last_panel(recording).text
+    async with database.transaction() as session:
+        await TenantRepository(session, users[0].id).save_session("encrypted")
+    await send(runtime, "Настройки")
+    assert "Укажите вашу учебную группу" in last_panel(recording).text
+    assert button(last_panel(recording), "Отмена").callback_data == "menu:cancel"
     await send(runtime, "/cancel")
-    assert last_panel(recording).reply_markup.keyboard[0][0].text == "Подключить аккаунт"
-    await send(runtime, "Подключить аккаунт")
-    assert "/connect#token=" in last_panel(recording).reply_markup.inline_keyboard[0][0].url
+    assert "Укажите вашу учебную группу" in last_panel(recording).text
+    await send(runtime, "БПИ267")
+    assert button(last_panel(recording), "Мои дедлайны").callback_data == "menu:deadlines"
+    await send(runtime, "Настройки")
+    assert "Учебная группа: БПИ267" in last_panel(recording).text
 
 
 async def test_chat_picker_pagination_search_save_and_isolation(
@@ -322,8 +324,9 @@ async def test_chat_picker_pagination_search_save_and_isolation(
     assert "Поиск: Канал 10" in panel.text
     assert any("Канал 10" in b.text for row in panel.reply_markup.inline_keyboard for b in row)
     await click(runtime, button(panel, "Сохранить").callback_data)
-    assert "Чатов подключено: 1" in last_panel(recording).text
-    assert button(last_panel(recording), "Первый анализ").callback_data == "analysis:first"
+    assert any("Чатов подключено: 1" in (getattr(c, "text", "") or "") for c in recording.calls)
+    assert button(last_panel(recording), "Да").callback_data == "analysis:first"
+    assert button(last_panel(recording), "Нет").callback_data == "analysis:skip"
     async with database.transaction() as session:
         chats = await TenantRepository(session, users[0].id).chats()
         assert [c.telegram_chat_id for c in chats] == [-1000000000100]
@@ -389,12 +392,85 @@ async def test_first_analysis_button_queues_real_service(connected_bot_runtime, 
     assert run.status == "succeeded" and run.kind == "initial"
     assert run.chat_count == 1 and run.message_count == 0
     assert any(isinstance(c, SendMessage) and "успешно завершён" in c.text for c in recording.calls)
+    runtime.jobs.enqueue = AsyncMock(wraps=runtime.jobs.enqueue)
+    await send(runtime, "/sync")
+    runtime.jobs.enqueue.assert_not_awaited()
+    assert "Откройте нужный раздел кнопками" in last_panel(recording).text
+    # A new message/callback ID bypasses receipt deduplication; the persisted choice still holds.
+    await click(runtime, "analysis:first")
+    assert not runtime.jobs.tasks
+    await click(runtime, "analysis:skip")
+    async with database.transaction() as session:
+        stored = await UserRepository(session).require(users[0].id)
+        assert stored.initial_analysis_choice is True
+        assert stored.initial_analysis_decided_at is not None
+    await send(runtime, "/start")
+    assert button(last_panel(recording), "Мои дедлайны").callback_data == "menu:deadlines"
 
 
 async def asyncio_gather(tasks):
     import asyncio
 
     await asyncio.gather(*list(tasks))
+
+
+async def test_skip_is_permanent_and_night_reads_all_new_messages(
+    connected_bot_runtime, database, users
+):
+    from datetime import timedelta
+
+    from deadline_assistant.domain import AnalysisOutput, AnalysisResult, MessageData
+
+    runtime, recording = connected_bot_runtime
+    chat_id = -1000000000100
+    await runtime.accounts.select(users[0].id, {chat_id})
+    await click(runtime, "analysis:skip")
+    assert not runtime.jobs.tasks
+    async with database.transaction() as session:
+        user = await UserRepository(session).require(users[0].id)
+        cutoff = user.initial_analysis_decided_at
+        assert user.initial_analysis_choice is False and cutoff is not None
+        chat = (await TenantRepository(session, user.id).chats())[0]
+        assert chat.history_after == cutoff
+    # Even a reader returning an old message must not send it to the LLM.
+    history = [
+        MessageData(
+            chat_id=chat_id,
+            message_id=i,
+            text=f"Сообщение {i}",
+            timestamp=cutoff + timedelta(seconds=1) if i > 1 else cutoff - timedelta(days=1),
+        )
+        for i in range(1, 122)
+    ]
+    reader, analyzer = AsyncMock(), AsyncMock(model="mock")
+    reader.fetch.side_effect = lambda encrypted, chat: [
+        m for m in history if m.message_id > chat.last_processed_message_id
+    ][: runtime.settings.sync_batch_size]
+    analyzer.analyze.return_value = AnalysisOutput(result=AnalysisResult())
+    runtime.sync.reader, runtime.sync.analyzer = reader, analyzer
+    await runtime.sync.sync_user(users[0].id)
+    analyzed = [m.message_id for call in analyzer.analyze.await_args_list for m in call.args[0]]
+    assert analyzed == list(range(2, 122))
+    await click(runtime, "analysis:first")
+    assert not runtime.jobs.tasks
+    await runtime.accounts.select(users[0].id, {chat_id, chat_id - 1})
+    async with database.transaction() as session:
+        chats = await TenantRepository(session, users[0].id).chats()
+        assert all(c.history_after is not None for c in chats)
+        assert next(c for c in chats if c.telegram_chat_id == chat_id).history_after == cutoff
+    await runtime.accounts.select(users[0].id, {chat_id - 1})
+    await runtime.accounts.track(users[0].id, chat_id)
+    async with database.transaction() as session:
+        reconnected = next(
+            c
+            for c in await TenantRepository(session, users[0].id).chats()
+            if c.telegram_chat_id == chat_id
+        )
+        assert reconnected.last_processed_message_id == 0
+        assert reconnected.initial_upper_message_id is None
+        assert reconnected.history_after is not None
+    await send(runtime, "/start")
+    assert "Проанализировать старые сообщения" not in last_panel(recording).text
 
 
 async def test_expired_edit_callback_cannot_modify_another_users_event(
@@ -492,6 +568,11 @@ async def test_conflict_buttons_apply_third_option_without_llm(
             ],
         )
     runtime.corrections.analyzer = AsyncMock()
+    await send(runtime, "/refresh")
+    summary = last_panel(recording)
+    assert "НЕОПРЕДЕЛЁННОСТИ" in summary.text
+    assert "Обнаружен конфликт" not in summary.text
+    assert summary.link_preview_options.is_disabled
     await send(runtime, "/conflicts")
     third = button(last_panel(recording), "Вариант 3").callback_data
     await click(runtime, third, user_id=202)
@@ -597,6 +678,7 @@ async def test_undo_correction_button_restores_previous_data_without_llm(
         await repo.apply_correction(correction.id, EventData(title="Новое название"))
     runtime.corrections.analyzer = AsyncMock()
     await send(runtime, "Мои дедлайны")
+    await click(runtime, button(last_panel(recording), "Ещё").callback_data)
     await click(runtime, button(last_panel(recording), "Отменить своё исправление").callback_data)
     await click(runtime, button(last_panel(recording), "Новое название").callback_data)
     assert "Старое название" in last_panel(recording).text
@@ -641,24 +723,102 @@ async def test_sources_show_author_time_and_one_full_text_at_a_time(
     assert "Полный текст номер 2" in text
 
 
-async def test_refresh_help_status_and_cancel_do_not_call_llm(connected_bot_runtime):
+async def test_inline_navigation_refresh_status_and_cancel_do_not_call_llm(connected_bot_runtime):
     runtime, recording = connected_bot_runtime
     runtime.corrections.analyzer = AsyncMock()
     runtime.sync.analyzer = AsyncMock()
-    await send(runtime, "Обновить сводку")
+    await send(runtime, "/start")
+    panel = last_panel(recording)
+    assert {b.text for row in panel.reply_markup.inline_keyboard for b in row} == {
+        "Мои дедлайны",
+        "Мои чаты",
+        "Циклические дедлайны",
+        "Настройки",
+    }
+    await click(runtime, button(panel, "Мои дедлайны").callback_data)
     assert "УЧЕБНЫЕ ДЕДЛАЙНЫ" in last_panel(recording).text
+    await click(runtime, button(last_panel(recording), "Ещё").callback_data)
     await click(runtime, button(last_panel(recording), "Обновить сводку").callback_data)
-    await click(runtime, button(last_panel(recording), "Помощь").callback_data)
-    assert "/status" in last_panel(recording).text
+    await click(runtime, button(last_panel(recording), "Ещё").callback_data)
+    await click(runtime, button(last_panel(recording), "Уточнения").callback_data)
+    assert "Нерешённых конфликтов нет" in last_panel(recording).text
     await send(runtime, "/status")
     assert "Анализ ещё не запускался" in last_panel(recording).text
-    await send(runtime, "Настройки")
+    await click(runtime, "menu:settings")
     await click(runtime, button(last_panel(recording), "Время сводки").callback_data)
-    await send(runtime, "/cancel")
+    await click(runtime, button(last_panel(recording), "Отмена").callback_data)
     context = runtime.dispatcher.fsm.get_context(bot=runtime.bot, chat_id=101, user_id=101)
     assert await context.get_state() is None
     runtime.corrections.analyzer.analyze.assert_not_awaited()
     runtime.sync.analyzer.analyze.assert_not_awaited()
+    assert not any(
+        isinstance(getattr(c, "reply_markup", None), ReplyKeyboardMarkup) for c in recording.calls
+    )
+    assert not any("/help" in (getattr(c, "text", "") or "") for c in recording.calls)
+
+
+async def test_removed_commands_and_old_buttons_cannot_start_analysis(connected_bot_runtime):
+    runtime, recording = connected_bot_runtime
+    runtime.jobs.enqueue = AsyncMock()
+    runtime.sync.analyzer = AsyncMock()
+    runtime.corrections.analyzer = AsyncMock()
+    for command in ("/help", "/sync", "/sync@test_deadlines_bot"):
+        await send(runtime, command)
+        assert button(last_panel(recording), "Мои дедлайны").callback_data == "menu:deadlines"
+    before = len([c for c in recording.calls if isinstance(c, SendMessage)])
+    for value in ("help", "sync"):
+        await click(runtime, value)
+    assert len([c for c in recording.calls if isinstance(c, SendMessage)]) == before
+    runtime.jobs.enqueue.assert_not_awaited()
+    runtime.sync.analyzer.analyze.assert_not_awaited()
+    runtime.corrections.analyzer.analyze.assert_not_awaited()
+    assert not runtime.jobs.tasks
+
+
+async def test_inline_chat_navigation_and_account_deletion_confirmation(
+    connected_bot_runtime, database, users
+):
+    runtime, recording = connected_bot_runtime
+    runtime.jobs.enqueue = AsyncMock()
+    await send(runtime, "/start")
+    await click(runtime, button(last_panel(recording), "Мои чаты").callback_data)
+    await click(runtime, button(last_panel(recording), "Канал 00").callback_data)
+    await click(runtime, button(last_panel(recording), "Главное меню").callback_data)
+    context = runtime.dispatcher.fsm.get_context(bot=runtime.bot, chat_id=101, user_id=101)
+    assert await context.get_state() is None
+    async with database.transaction() as session:
+        assert await TenantRepository(session, users[0].id).chats() == []
+    await click(runtime, button(last_panel(recording), "Настройки").callback_data)
+    await click(runtime, button(last_panel(recording), "Аккаунт").callback_data)
+    await click(runtime, button(last_panel(recording), "Удалить мои данные").callback_data)
+    assert "необратимо" in last_panel(recording).text
+    assert button(last_panel(recording), "Удалить все мои данные").callback_data.startswith(
+        "privacy:delete:"
+    )
+    async with database.transaction() as session:
+        assert await UserRepository(session).require(users[0].id)
+    await click(runtime, button(last_panel(recording), "Отмена").callback_data)
+    runtime.jobs.enqueue.assert_not_awaited()
+    assert not any(
+        isinstance(getattr(c, "reply_markup", None), ReplyKeyboardMarkup) for c in recording.calls
+    )
+
+
+async def test_startup_publishes_only_start_command(bot_runtime):
+    import asyncio
+
+    runtime, recording = bot_runtime
+    with (
+        patch.object(runtime.scheduler, "start", new=AsyncMock()),
+        patch.object(runtime.jobs, "start", new=AsyncMock()),
+        patch.object(runtime.dispatcher, "start_polling", new=AsyncMock()),
+    ):
+        await runtime.start()
+        runtime.stopping = True
+        await asyncio.gather(runtime.bot_task)
+    await runtime.lifetime.aclose()
+    commands = next(c for c in recording.calls if isinstance(c, SetMyCommands))
+    assert [(c.command, c.description) for c in commands.commands] == [("start", "Открыть меню")]
 
 
 async def test_failed_correction_is_saved_and_shows_last_summary(
@@ -738,7 +898,7 @@ async def test_actual_telegram_forbidden_marks_block_and_inbound_message_clears_
     async with database.transaction() as session:
         assert (await session.get(User, users[0].id)).bot_blocked_at
     recording.make_request = original
-    await send(runtime, "/help")
+    await send(runtime, "/start")
     async with database.transaction() as session:
         assert (await session.get(User, users[0].id)).bot_blocked_at is None
 
@@ -763,6 +923,7 @@ async def test_undo_list_includes_accidentally_expired_and_completed_work(
         await repo.complete(completed.id)
     await send(runtime, "Мои дедлайны")
     assert "Восстановить срок" not in last_panel(recording).text
+    await click(runtime, button(last_panel(recording), "Ещё").callback_data)
     await click(runtime, button(last_panel(recording), "Отменить своё исправление").callback_data)
     undo_panel = last_panel(recording)
     assert button(undo_panel, "Восстановить срок")
@@ -776,21 +937,24 @@ async def test_undo_list_includes_accidentally_expired_and_completed_work(
 
 
 async def test_group_prompt_once_survives_fsm_restart_and_settings_allow_change(
-    bot_runtime, database, users
+    connected_bot_runtime, database, users
 ):
     from deadline_assistant.repositories.users import UserRepository
 
-    runtime, recording = bot_runtime
+    runtime, recording = connected_bot_runtime
+    async with database.transaction() as session:
+        (await UserRepository(session).require(users[0].id)).study_group = None
+        await UserRepository(session).set_study_group(users[1].id, "БПИ269")
     await send(runtime, "/start")
     assert "БПИ267" in last_panel(recording).text
     context = runtime.dispatcher.fsm.get_context(bot=runtime.bot, chat_id=101, user_id=101)
     await context.clear()
     await send(runtime, "бпи 267")
-    assert "сохранена: БПИ267" in last_panel(recording).text
+    assert any("сохранена: БПИ267" in (getattr(c, "text", "") or "") for c in recording.calls)
     async with database.transaction() as session:
         repo = UserRepository(session)
         assert (await repo.require(users[0].id)).study_group == "БПИ267"
-        assert (await repo.require(users[1].id)).study_group is None
+        assert (await repo.require(users[1].id)).study_group == "БПИ269"
     recording.calls.clear()
     await send(runtime, "/start")
     assert not any(
@@ -808,14 +972,16 @@ async def test_group_prompt_once_survives_fsm_restart_and_settings_allow_change(
     assert "сохранена: БПИ269" in last_panel(recording).text
 
 
-async def test_skipping_group_does_not_prompt_again(bot_runtime):
-    runtime, recording = bot_runtime
+async def test_group_cannot_be_skipped_or_bypassed(connected_bot_runtime, database, users):
+    runtime, recording = connected_bot_runtime
+    async with database.transaction() as session:
+        (await UserRepository(session).require(users[0].id)).study_group = None
     await send(runtime, "/start")
     await send(runtime, "/cancel")
-    assert "/connect#token=" in last_panel(recording).reply_markup.inline_keyboard[0][0].url
+    assert "Укажите вашу учебную группу" in last_panel(recording).text
     recording.calls.clear()
     await send(runtime, "/start")
-    assert not any(
-        isinstance(call, SendMessage) and "Укажите вашу учебную группу" in call.text
-        for call in recording.calls
-    )
+    assert "Укажите вашу учебную группу" in last_panel(recording).text
+    await click(runtime, "settings:time")
+    assert "Укажите вашу учебную группу" in last_panel(recording).text
+    runtime.gateway.dialogs.assert_not_awaited()

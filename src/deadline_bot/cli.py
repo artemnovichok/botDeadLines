@@ -63,6 +63,9 @@ def parser() -> argparse.ArgumentParser:
     mode.add_argument(
         "--dry-run", action="store_true", help="Показать изменения во временной БД без отправки"
     )
+    cycle.add_argument(
+        "--announce", metavar="ТЕКСТ", help="До анализа оповестить выбранных пользователей"
+    )
     summary = commands.add_parser("send-summary", help="Отправить текущую сводку из БД без LLM")
     summary.add_argument(
         "--user", required=True, type=positive_id, help="Числовой Telegram user ID"
@@ -122,6 +125,11 @@ def print_result(result: CycleResult) -> None:
 
 
 async def execute(args: argparse.Namespace, settings: Settings) -> int:
+    announcement = getattr(args, "announce", None)
+    if args.command == "run-cycle" and announcement is not None:
+        if args.dry_run or not announcement.strip():
+            print("--announce требует непустой текст и несовместим с --dry-run.")
+            return EXIT_USAGE
     if args.command == "test-llm":
         if not settings.llm_enabled:
             print("Задайте LOWROUTER_API_KEY и LLM_MODEL.")
@@ -204,7 +212,7 @@ async def execute(args: argparse.Namespace, settings: Settings) -> int:
                 "LLM_MODEL",
             ],
         )
-        if args.send_now and not settings.bot_token:
+        if (args.send_now or announcement) and not settings.bot_token:
             missing.append("TELEGRAM_BOT_TOKEN")
         if missing:
             print("Заполните настройки: " + ", ".join(missing))
@@ -226,6 +234,12 @@ async def execute(args: argparse.Namespace, settings: Settings) -> int:
                 "БД и checkpoint не меняются, уведомлений не будет."
             )
         print(f"Подключённых пользователей для обработки: {len(users)}")
+        if announcement:
+            notifier = runtime.cycle.summary.notifier
+            assert notifier is not None
+            for user in users:
+                await notifier.send(user.telegram_user_id, announcement)
+            print("Предварительное оповещение отправлено. Начинаю анализ.")
         results = await runtime.cycle.run_many(
             users,
             send_now=args.send_now,

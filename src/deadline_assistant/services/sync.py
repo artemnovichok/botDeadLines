@@ -145,7 +145,9 @@ class SyncService:
                             chat = await self._check(
                                 TenantRepository(session, user_id), encrypted, chat.id
                             )
-                        starting = chat.last_processed_message_id == 0
+                        starting = (
+                            chat.last_processed_message_id == 0 and chat.history_after is None
+                        )
                         messages = sorted(
                             await retry(
                                 partial(self.reader.fetch, encrypted, chat),
@@ -192,6 +194,10 @@ class SyncService:
                                 )
                                 stored.last_successful_sync_at = utcnow()
                                 stored.initialization_status = "ready"
+                                if stored.last_processed_message_id == 0:
+                                    stored.history_after = stored.history_after or utcnow().replace(
+                                        microsecond=0
+                                    )
                             progress()
                             break
                 from deadline_assistant.services.corrections import CorrectionService
@@ -260,7 +266,7 @@ class SyncService:
         async with self.database.transaction() as session:
             user = await UserRepository(session).require(user_id)
             repo = TenantRepository(session, user_id)
-            await self._check(repo, encrypted, chat_id)
+            chat = await self._check(repo, encrypted, chat_id)
             pending = [m for m in messages if not await repo.is_processed(m)]
             if not pending:
                 return
@@ -272,7 +278,11 @@ class SyncService:
             recent = [
                 m
                 for m in pending
-                if refresh_sources or max(m.timestamp, m.edit_timestamp or m.timestamp) >= cutoff
+                if refresh_sources
+                or (
+                    max(m.timestamp, m.edit_timestamp or m.timestamp) >= cutoff
+                    and (chat.history_after is None or m.timestamp >= chat.history_after)
+                )
             ]
             consumed = max(
                 saved_run.token_usage.get("total_tokens", 0),
@@ -337,9 +347,10 @@ class SyncService:
             conflicts_after = await session.scalar(conflict_query) or 0
             for message in pending:
                 await repo.mark_processed(message)
-            stored.last_processed_message_id = max(
-                stored.last_processed_message_id, max(m.message_id for m in messages)
-            )
+            if not refresh_sources:
+                stored.last_processed_message_id = max(
+                    stored.last_processed_message_id, max(m.message_id for m in messages)
+                )
             stored.last_successful_sync_at = utcnow()
             saved_run = await session.get(AnalysisRun, run_id)
             assert saved_run is not None

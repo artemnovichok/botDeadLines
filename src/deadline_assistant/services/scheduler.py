@@ -109,7 +109,7 @@ class SchedulerService:
             await asyncio.gather(*(process(user) for user in users))
 
     async def _tick_user(self, user: User, now: datetime) -> None:
-        if self.stopping:
+        if self.stopping or not user.study_group or user.initial_analysis_choice is None:
             return
         async with self.database.transaction() as session:
             credential = await TenantRepository(session, user.id).telegram_session()
@@ -134,6 +134,9 @@ class SchedulerService:
                     continue
                 local_date -= timedelta(days=1)
             if kind == "sync":
+                night_due = datetime.combine(local_date, due, ZoneInfo(user.timezone))
+                if now - night_due >= timedelta(hours=1):
+                    continue
                 async with self.database.transaction() as session:
                     repo = TenantRepository(session, user.id)
                     credential = await repo.telegram_session()
@@ -153,6 +156,9 @@ class SchedulerService:
 
     async def _deliver_locked(self, user: User, kind: str, now: datetime, local_date: date) -> None:
         async with self.database.transaction() as session:
+            stored_user = await UserRepository(session).require(user.id)
+            if not stored_user.study_group or stored_user.initial_analysis_choice is None:
+                return
             credential = await TenantRepository(session, user.id).telegram_session()
             if credential is None or credential.status != "connected":
                 return

@@ -67,4 +67,7 @@ async def connected_users(database: Database, users: tuple[User, User]) -> tuple
     async with database.transaction() as session:
         for user in users:
             await TenantRepository(session, user.id).save_session("encrypted")
+            stored = await UserRepository(session).set_study_group(user.id, "БПИ267")
+            stored.initial_analysis_choice = True
+            stored.initial_analysis_decided_at = stored.created_at
     return users

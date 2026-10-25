@@ -58,7 +58,11 @@ class MemoryBuilder:
     ) -> AnalysisContext:
         now = now or utcnow()
         events = list(
-            await repo.session.scalars(select(Event).where(Event.user_id == repo.user_id))
+            await repo.session.scalars(
+                select(Event).where(
+                    Event.user_id == repo.user_id, Event.recurring_deadline_id.is_(None)
+                )
+            )
         )
         corrections = list(
             await repo.session.scalars(
@@ -314,6 +318,8 @@ class OperationApplier:
             )
             if event is None or event.version != target.expected_version:
                 raise StaleState("Событие изменилось во время анализа")
+            if event.recurring_deadline_id is not None:
+                raise AnalysisValidationError("Циклические дедлайны изменяются только владельцем.")
         by_ref = {(m.chat_id, m.message_id): m for m in messages}
 
         async def resolve(evidence: Evidence) -> list[UUID]:

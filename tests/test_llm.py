@@ -325,7 +325,7 @@ async def test_schema_is_in_prompt_even_when_gateway_ignores_response_format(con
         payload = json.loads(request.content)
         assert payload["response_format"]["type"] == "json_schema"
         # The gateway forwards messages but silently discards response_format.
-        schema = json.loads(payload["messages"][0]["content"].split("JSON Schema ответа:\n")[1])
+        schema = json.loads(payload["messages"][0]["content"].split("Response JSON Schema:\n")[1])
         assert "title" in schema["$defs"]["EventData"]["required"]
         assert "lab" in schema["$defs"]["EventType"]["enum"]
         assert "laboratory" not in schema["$defs"]["EventType"]["enum"]
@@ -355,7 +355,7 @@ async def test_repair_identifies_fields_without_leaking_model_or_message_text(co
         if len(calls) == 1:
             return completion(json.dumps(invalid))
         system = payload["messages"][0]["content"]
-        feedback = system.split("Ошибки проверки: ")[1]
+        feedback = system.split("Validation errors: ")[1]
         assert '"path": "operations.0.create_event.event.title", "error": "missing"' in feedback
         assert '"path": "operations.0.create_event.event.event_type", "error": "enum"' in feedback
         assert "extra_forbidden" in feedback and "unknown_field" in feedback

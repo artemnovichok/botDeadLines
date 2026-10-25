@@ -2,6 +2,7 @@ import asyncio
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from typing import Any, TypedDict
 from uuid import UUID
 
@@ -172,7 +173,7 @@ class TelegramGateway:
                 "username": getattr(entity, "username", None) or "",
             }
             messages: dict[int, MessageData] = {}
-            if chat.last_processed_message_id == 0:
+            if chat.last_processed_message_id == 0 and chat.history_after is None:
                 async for item in client.iter_messages(
                     peer,
                     limit=self.settings.initial_message_limit,
@@ -190,6 +191,10 @@ class TelegramGateway:
                     min_id=chat.last_processed_message_id,
                     reverse=True,
                     limit=self.settings.sync_batch_size,
+                    # Telegram dates have one-second precision; include the boundary second.
+                    offset_date=(chat.history_after - timedelta(seconds=1))
+                    if chat.history_after is not None and not chat.last_processed_message_id
+                    else None,
                     max_id=(chat.initial_upper_message_id + 1)
                     if chat.initialization_status == "pending" and chat.initial_upper_message_id
                     else 0,
@@ -208,7 +213,14 @@ class TelegramGateway:
                         messages[item.id] = self._message(
                             item, chat.telegram_chat_id, current_metadata
                         )
-            return sorted(messages.values(), key=lambda message: message.message_id)
+            return sorted(
+                (
+                    message
+                    for message in messages.values()
+                    if chat.history_after is None or message.timestamp >= chat.history_after
+                ),
+                key=lambda message: message.message_id,
+            )
 
     async def fetch_sources(
         self, encrypted_session: str, chat: TrackedChat, message_ids: list[int]

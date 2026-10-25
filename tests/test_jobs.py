@@ -7,12 +7,14 @@ from sqlalchemy import select
 from deadline_assistant.db.models import AnalysisRun
 from deadline_assistant.domain import AnalysisOutput, AnalysisResult, IntegrationUnavailable
 from deadline_assistant.repositories.tenant import TenantRepository
+from deadline_assistant.repositories.users import UserRepository
 from deadline_assistant.services.jobs import AnalysisJobs, render_run
 from deadline_assistant.services.sync import SyncService
 
 
 async def make_jobs(database, users, configured):
     async with database.transaction() as session:
+        await UserRepository(session).set_study_group(users[0].id, "БПИ267")
         repo = TenantRepository(session, users[0].id)
         await repo.save_session("encrypted")
         await repo.track(-1001, "Группа", {"kind": "chat", "id": 1})

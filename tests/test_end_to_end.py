@@ -29,7 +29,6 @@ from deadline_assistant.repositories.users import UserRepository
 async def connected_student(bot_runtime, database):  # noqa: F811
     runtime, recording = bot_runtime
     await send(runtime, "/start")
-    await send(runtime, "БПИ267")
     url = last_panel(recording).reply_markup.inline_keyboard[0][0].url
     token = url.split("#token=", 1)[1]
     browser, csrf = await runtime.auth.exchange(token)
@@ -47,6 +46,7 @@ async def connected_student(bot_runtime, database):  # noqa: F811
     assert await runtime.login.phone(link, "+79990000000") == "code_required"
     assert await runtime.login.code(link, "12345") == "connected"
     await asyncio.gather(*runtime.login.finalizers)
+    await send(runtime, "БПИ267")
     await send(runtime, "/chats")
     await click(runtime, button(last_panel(recording), "Канал 00").callback_data)
     await click(runtime, button(last_panel(recording), "Сохранить").callback_data)
@@ -136,7 +136,7 @@ async def test_complete_student_lifecycle_conflict_restart_and_delete(connected_
     calls = analyzer.analyze.await_count
     await runtime.cycle.run_user(user.id, send_now=True)
     assert analyzer.analyze.await_count == calls
-    # A new scheduler instance after a missed night uses the same checkpoint and durable delivery.
+    # A daytime restart waits for the next night, preserving checkpoint and delivery state.
     from deadline_assistant.services.scheduler import SchedulerService
 
     restored = SchedulerService(
@@ -144,6 +144,12 @@ async def test_complete_student_lifecycle_conflict_restart_and_delete(connected_
     )
     await restored.tick(now.replace(hour=6, minute=0))
     await restored.tick(now.replace(hour=6, minute=1))
+    assert analyzer.analyze.await_count == calls
+    from zoneinfo import ZoneInfo
+
+    night = (now + timedelta(days=1)).astimezone(ZoneInfo(user.timezone)).replace(hour=2, minute=10)
+    await restored.tick(night)
+    await restored.tick(night.replace(minute=11))
     assert analyzer.analyze.await_count == calls
     async with database.transaction() as session:
         assert any(

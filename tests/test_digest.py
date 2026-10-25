@@ -108,7 +108,7 @@ async def test_day_only_approximate_times_and_source_links(database, users):
         assert "Актуально на 19 октября 2026" in summary
         assert "23:59" not in summary and "00:00" not in summary
         assert "Примерно 20 октября 2026, 16:00–18:00" in summary
-        assert '<a href="https://t.me/math/42?x=1&amp;y=2">Источник</a>' in summary
+        assert '<a href="https://t.me/math/42?x=1&amp;y=2">ссылка</a>' in summary
         listing = await repo.event_list(summary.list_id)
         assert [e["id"] for e in listing.entries][0] == str(first.id)
 
@@ -116,7 +116,7 @@ async def test_day_only_approximate_times_and_source_links(database, users):
 async def test_active_resubmission_and_unknown_date_are_preserved(database, users):
     async with database.transaction() as session:
         repo = TenantRepository(session, users[0].id)
-        await repo.create_event(
+        late_task = await repo.create_event(
             EventData(
                 title="Досдача",
                 due_at="2026-10-18T00:00:00+03:00",
@@ -127,15 +127,19 @@ async def test_active_resubmission_and_unknown_date_are_preserved(database, user
         )
         await repo.create_event(EventData(title="Ждём выдачи"))
         _, summary = await build_digest(repo, "Europe/Moscow", now=NOW)
-        assert summary.index("Досдача</b>") < summary.index("📅 НА ЭТОЙ НЕДЕЛЕ")
+        assert summary.index("Досдача</b>") < summary.index("НЕОПРЕДЕЛЁННОСТИ")
         assert "Основной срок: 18 октября 2026" in summary
         assert "Действует период досдачи" in summary and "Минус 10%" in summary
-        assert summary.index("Ожидают уточнения") < summary.index("Ждём выдачи")
+        assert summary.index("НЕОПРЕДЕЛЁННОСТИ") < summary.index("Ждём выдачи")
         _, next_day = await build_digest(repo, "Europe/Moscow", now=NOW + timedelta(days=1))
         assert "Досдача</b>" in next_day
         _, after = await build_digest(repo, "Europe/Moscow", now=NOW + timedelta(days=2))
         assert "Досдача</b>" not in after
         assert "Ждём выдачи" in after
+        late_task.needs_clarification = True
+        _, uncertain = await build_digest(repo, "Europe/Moscow", now=NOW)
+        assert uncertain.index("НЕОПРЕДЕЛЁННОСТИ") < uncertain.index("Досдача</b>")
+        assert "Действует период досдачи" in uncertain and "Предстоит досдача" not in uncertain
 
 
 def test_future_resubmission_and_unknown_end():
@@ -160,10 +164,12 @@ async def test_past_disputed_date_remains_visible(database, users):
             item.id,
             EventData(title="Спор", due_at="2026-10-02T00:00:00+03:00", date_precision="day"),
         )
-        cards, summary = await build_digest(repo, "Europe/Moscow", now=NOW)
+        cards, summary = await build_digest(
+            repo, "Europe/Moscow", now=NOW, include_conflict_cards=True
+        )
         assert cards and "Дата требует подтверждения" in summary
         assert "1 октября" in summary and "2 октября" in summary
-        assert "Ожидают уточнения" in summary
+        assert "НЕОПРЕДЕЛЁННОСТИ" in summary
 
 
 async def test_conflicting_conditions_do_not_repeat_identical_unknown_dates(database, users):
@@ -173,8 +179,10 @@ async def test_conflicting_conditions_do_not_repeat_identical_unknown_dates(data
         await repo.create_conflict(
             item.id, EventData(title="Факультатив", submission_conditions="Онлайн")
         )
-        cards, summary = await build_digest(repo, "Europe/Moscow", now=NOW)
-        assert cards and "Есть противоречия в условиях" in summary
+        cards, summary = await build_digest(
+            repo, "Europe/Moscow", now=NOW, include_conflict_cards=True
+        )
+        assert cards and "условия требуют подтверждения" in summary
         assert "Вариант: дата уточняется" not in summary
         assert "Дата требует подтверждения" not in summary
 
@@ -306,3 +314,122 @@ async def test_generic_control_titles_show_their_source_courses(database, users)
         _, summary = await build_digest(repo, "Europe/Moscow", now=NOW)
         assert "Матан ПИ — Контрольная работа" in summary
         assert "HSE-SE-DM — Контрольная работа" in summary
+
+
+async def test_uncertainties_are_separate_compact_and_link_to_the_latest_evidence(database, users):
+    from deadline_assistant.domain import MessageData
+
+    async with database.transaction() as session:
+        repo = TenantRepository(session, users[0].id)
+        definite = await repo.create_event(
+            EventData(
+                title="Алгебра — КР № 1",
+                due_at="2026-10-21T00:00:00+03:00",
+                date_precision="day",
+                location=None,
+            )
+        )
+        vague = await repo.create_event(
+            EventData(
+                title="Дискретка — контрольная",
+                description="На следующей неделе; точный день не объявлен.",
+                needs_clarification=True,
+            )
+        )
+        approximate = await repo.create_event(
+            EventData(
+                title="Матан — тест",
+                due_at="2026-10-26T00:00:00+03:00",
+                end_at="2026-11-01T23:59:59+03:00",
+                date_precision="approximate",
+            )
+        )
+        for number, task in enumerate((definite, vague, approximate), 1):
+            source = await repo.source(
+                MessageData(
+                    chat_id=-100123,
+                    message_id=number,
+                    text=task.title,
+                    timestamp=NOW,
+                    source_url=f"https://t.me/c/123/{number}",
+                )
+            )
+            await repo.attach_source(task.id, source.id)
+        cards, summary = await build_digest(repo, "Europe/Moscow", now=NOW)
+        confirmed, uncertainties = summary.split("❔ НЕОПРЕДЕЛЁННОСТИ")
+        assert not cards
+        assert "Алгебра — КР № 1" in confirmed and "Алгебра — КР № 1" not in uncertainties
+        assert "Дискретка — контрольная" not in confirmed
+        assert "Матан — тест" not in confirmed
+        assert "На следующей неделе; точный день не объявлен." in uncertainties
+        assert '<a href="https://t.me/c/123/2">ссылка</a>' in uncertainties
+        assert "00:00" not in summary and "23:59" not in summary
+        assert "Место:" not in summary and "Нет предстоящих событий" not in summary
+        assert all(summary.count(task.title) == 1 for task in (definite, vague, approximate))
+
+        alternative = await repo.source(
+            MessageData(
+                chat_id=-100123,
+                message_id=4,
+                text="КР перенесли, но есть противоречащие подтверждения",
+                timestamp=NOW + timedelta(hours=1),
+                source_url="https://t.me/c/123/4?x=1&y=2",
+            )
+        )
+        await repo.create_conflict(
+            definite.id,
+            EventData(
+                title=definite.title,
+                due_at="2026-10-22T00:00:00+03:00",
+                date_precision="day",
+            ),
+            [alternative.id],
+        )
+        cards, summary = await build_digest(repo, "Europe/Moscow", now=NOW)
+        assert not cards and "📅 НА ЭТОЙ НЕДЕЛЕ" not in summary
+        assert '<a href="https://t.me/c/123/4?x=1&amp;y=2">ссылка</a>' in summary
+        assert "21 октября 2026 / 22 октября 2026" in summary
+        cards, _ = await build_digest(repo, "Europe/Moscow", now=NOW, include_conflict_cards=True)
+        assert len(cards) == 1 and "Вариант 2" in cards[0].text
+
+
+async def test_resolved_uncertainty_moves_to_calendar_and_empty_block_disappears(database, users):
+    async with database.transaction() as session:
+        repo = TenantRepository(session, users[0].id)
+        task = await repo.create_event(EventData(title="Контрольная", needs_clarification=True))
+        _, summary = await build_digest(repo, "Europe/Moscow", now=NOW)
+        assert "НЕОПРЕДЕЛЁННОСТИ" in summary
+        await repo.write_event(
+            task,
+            EventData(
+                title="Контрольная",
+                due_at="2026-10-21T00:00:00+03:00",
+                date_precision="day",
+            ),
+        )
+        _, summary = await build_digest(repo, "Europe/Moscow", now=NOW)
+        assert "НЕОПРЕДЕЛЁННОСТИ" not in summary
+        assert "📅 НА ЭТОЙ НЕДЕЛЕ" in summary
+        assert summary.count("Контрольная") == 1
+
+
+async def test_uncertainty_does_not_invent_missing_or_unsafe_source_links(database, users):
+    from deadline_assistant.domain import MessageData
+
+    async with database.transaction() as session:
+        repo = TenantRepository(session, users[0].id)
+        task = await repo.create_event(EventData(title="<Тест & ДЗ>"))
+        source = await repo.source(
+            MessageData(
+                chat_id=-1,
+                message_id=1,
+                text="Когда-то будет тест",
+                timestamp=NOW,
+                source_url="javascript:alert(1)",
+            )
+        )
+        await repo.attach_source(task.id, source.id)
+        _, summary = await build_digest(repo, "Europe/Moscow", now=NOW)
+        assert "&lt;Тест &amp; ДЗ&gt;" in summary
+        assert "ссылка недоступна" in summary
+        assert "javascript:" not in summary and "<a " not in summary

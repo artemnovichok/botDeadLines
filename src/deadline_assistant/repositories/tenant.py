@@ -90,7 +90,11 @@ class TenantRepository:
         return list(
             await self.session.scalars(
                 select(Event)
-                .where(Event.user_id == self.user_id, Event.status == "active")
+                .where(
+                    Event.user_id == self.user_id,
+                    Event.status == "active",
+                    Event.recurring_deadline_id.is_(None),
+                )
                 .order_by(Event.due_at.asc().nulls_last(), Event.created_at)
                 .limit(limit)
             )
@@ -125,6 +129,10 @@ class TenantRepository:
 
     async def complete(self, event_id: UUID) -> Event:
         event = await self.event(event_id)
+        if event.recurring_deadline_id is not None:
+            from deadline_assistant.services.recurring import RecurringService
+
+            return await RecurringService(self.session, self.user_id).close(event.id, event.version)
         event.completed_by_user = True
         await self.write_event(
             event, event_data(event).model_copy(update={"status": EventStatus.COMPLETED})
@@ -134,7 +142,9 @@ class TenantRepository:
     async def correction(
         self, event_id: UUID, text: str, chat_id: int | None = None, message_id: int | None = None
     ) -> UserCorrection:
-        await self.event(event_id)
+        event = await self.event(event_id)
+        if event.recurring_deadline_id is not None:
+            raise ValueError("Измените повторение в меню «Циклические дедлайны».")
         if not text.strip() or len(text) > 6000:
             raise ValueError("Исправление должно содержать от 1 до 6000 символов")
         if chat_id is not None and message_id is not None:
@@ -357,6 +367,8 @@ class TenantRepository:
     async def write_event(self, event: Event, data: EventData) -> None:
         if event.user_id != self.user_id:
             raise EntityNotFound
+        if event.recurring_deadline_id is not None:
+            raise ValueError("Измените повторение в меню «Циклические дедлайны».")
         if event.completed_by_user:
             data = data.model_copy(update={"status": EventStatus.COMPLETED})
         if event_data(event) == data:
@@ -377,6 +389,7 @@ class TenantRepository:
             await self.session.scalars(
                 select(Event).where(
                     Event.user_id == self.user_id,
+                    Event.recurring_deadline_id.is_(None),
                     (Event.dedup_key == event_key(data)) | Event.dedup_key.is_(None),
                 )
             )

@@ -121,7 +121,7 @@ async def test_progress_is_sent_while_request_waits_and_stop_is_owner_scoped(
     progress = asyncio.Event()
 
     async def receive(user_id, text):
-        if "/stop_sync" in text:
+        if "Анализ: выполняется." in text:
             progress.set()
 
     async def fetch(*args):

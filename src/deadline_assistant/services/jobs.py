@@ -20,9 +20,9 @@ STATUS = {
     "queued": "в очереди",
     "running": "выполняется",
     "succeeded": "успешно завершён",
-    "partial": "обработана часть истории; продолжение по /sync",
+    "partial": "обработана часть истории; продолжение в следующий ночной анализ",
     "failed": "завершился с ошибкой",
-    "interrupted": "прерван; запустите повторно",
+    "interrupted": "прерван; продолжение в следующий ночной анализ",
 }
 ERRORS = {
     "LLMProviderUnavailable": "Сервис ИИ временно недоступен; автоматический повтор отключён",
@@ -58,7 +58,7 @@ def render_run(run: AnalysisRun, timezone: str = "Europe/Moscow") -> str:
         + f"\nДлительность: {duration:.2f} с"
         + (
             "\nДостигнут лимит одного запуска. Текущая порция сохранена. "
-            "Продолжить с этого места: /sync."
+            "Продолжение с этого места — в следующий ночной анализ."
             if run.status == "partial"
             else ""
         )
@@ -114,6 +114,10 @@ class AnalysisJobs:
                 raise IntegrationUnavailable("Сначала подключите аккаунт Telegram")
             if not chats:
                 raise IntegrationUnavailable("Сначала выберите чаты в «Мои чаты»")
+            if initial and not await UserRepository(session).decide_initial_analysis(
+                user_id, analyze=True
+            ):
+                return False
             run = AnalysisRun(
                 user_id=user_id,
                 model=self.sync.analyzer.model,
@@ -170,7 +174,7 @@ class AnalysisJobs:
                 await self.notifier.send(
                     user.telegram_user_id,
                     render_run(run, user.timezone)
-                    + "\nСохранённые дедлайны: /events. Остановить анализ: /stop_sync.",
+                    + "\nСохранённые дедлайны доступны в главном меню.",
                 )
             except asyncio.CancelledError:
                 raise
@@ -184,6 +188,11 @@ class AnalysisJobs:
             asyncio.create_task(self._report_progress(user_id, run_id)) if self.notifier else None
         )
         try:
+            async with self.database.transaction() as session:
+                user = await UserRepository(session).require(user_id)
+                run = await session.get(AnalysisRun, run_id)
+                if run is not None and run.kind == "initial" and not user.study_group:
+                    raise IntegrationUnavailable("Сначала укажите учебную группу: /group")
             await self.sync.sync_user(user_id, run_id)
         except asyncio.CancelledError:
             await self._finish_queued(run_id, "interrupted")
@@ -191,7 +200,9 @@ class AnalysisJobs:
         except Exception as exc:
             await self._finish_queued(run_id, "failed")
             reason = (
-                str(exc) if isinstance(exc, IntegrationUnavailable) else "Повторите анализ позже."
+                str(exc)
+                if isinstance(exc, IntegrationUnavailable)
+                else "Продолжение — в следующий ночной анализ."
             )
         finally:
             if reporter:

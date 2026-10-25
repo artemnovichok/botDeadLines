@@ -15,6 +15,7 @@ from deadline_assistant.db.models import (
 from deadline_assistant.domain import EventData, utcnow
 from deadline_assistant.repositories.tenant import TenantRepository
 from deadline_assistant.services.lifecycle import calendar_range
+from deadline_assistant.services.recurring import RecurringService
 from deadline_assistant.services.summary import group_events, render_summary
 from deadline_assistant.services.telegram_text import HtmlText
 
@@ -100,10 +101,12 @@ async def build_digest(
     *,
     now: datetime | None = None,
     stale_reason: str | None = None,
+    include_conflict_cards: bool = False,
 ) -> tuple[list[ConflictCard], HtmlText]:
     now = now or utcnow()
     cards = []
     disputed: dict[UUID, list[EventData]] = {}
+    conflict_sources: dict[UUID, list[SourceMessage]] = {}
     for conflict in await repo.conflicts():
         event = await repo.event(conflict.event_id)
         options = await repo.conflict_options(conflict.id)
@@ -111,6 +114,20 @@ async def build_digest(
         if event.status != "active":
             continue
         disputed[event.id] = variants
+        conflict_sources[event.id] = list(
+            await repo.session.scalars(
+                select(SourceMessage)
+                .join(ConflictOptionSource, ConflictOptionSource.source_id == SourceMessage.id)
+                .where(
+                    ConflictOptionSource.option_id.in_([option.id for option in options]),
+                    ConflictOptionSource.user_id == repo.user_id,
+                    SourceMessage.user_id == repo.user_id,
+                )
+                .distinct()
+            )
+        )
+        if not include_conflict_cards:
+            continue
         lines = [f"Обнаружен конфликт по событию «{event.title}»."]
         buttons = []
         for option, data in zip(options, variants, strict=True):
@@ -179,9 +196,12 @@ async def build_digest(
 
         buttons.append(("Посмотреть источники", f"evsrc:{short_id(event.id)}"))
         cards.append(ConflictCard("\n".join(lines), buttons))
-    groups = group_events(await repo.active_events(), timezone, now, disputed)
+    recurring = await RecurringService(repo.session, repo.user_id).current_events(now=now)
+    groups = group_events([*await repo.active_events(), *recurring], timezone, now, disputed)
     items = [item.event for group in groups for item in group]
-    sources_by_event = {e.id: await repo.current_sources(e.id) for e in items}
+    sources_by_event = {
+        e.id: [*await repo.current_sources(e.id), *conflict_sources.get(e.id, [])] for e in items
+    }
     latest = await repo.session.scalar(
         select(AnalysisRun)
         .where(AnalysisRun.user_id == repo.user_id)
@@ -190,7 +210,7 @@ async def build_digest(
     )
     stale = stale_reason
     if latest and latest.status == "partial":
-        stale = "Обработана часть истории. События сохранены; продолжить анализ: /sync."
+        stale = "Обработана часть истории. События сохранены; продолжение анализа — ночью."
     if latest and latest.status in {"failed", "interrupted"}:
         stale = (
             "Данные могут быть устаревшими: последний анализ не завершён. "

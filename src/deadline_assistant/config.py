@@ -71,7 +71,7 @@ class Settings(DatabaseSettings):
     daily_digest_hour: int | None = Field(default=None, ge=0, le=23)
     digest_catchup_hours: int = Field(default=6, ge=1, le=24)
     delivery_max_attempts: int = Field(default=5, ge=1, le=20)
-    initial_message_limit: int = 1000
+    initial_message_limit: int = 100
     message_max_age_days: int = Field(default=90, ge=1, le=3650)
     sync_batch_size: int = 50
     edit_lookback_limit: int = 100
@@ -152,8 +152,8 @@ class Settings(DatabaseSettings):
             <= 0
         ):
             raise ValueError("Лимиты и сроки должны быть положительными")
-        if self.initial_message_limit > 1000:
-            raise ValueError("INITIAL_MESSAGE_LIMIT не должен превышать 1000")
+        # Preserve existing .env files while enforcing the new history ceiling.
+        self.initial_message_limit = min(self.initial_message_limit, 100)
         if self.sync_batch_size > 100:
             raise ValueError("SYNC_BATCH_SIZE не должен превышать 100")
         if self.bot_token and not self.session_encryption_key:

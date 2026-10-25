@@ -60,6 +60,12 @@ def test_configuration_errors_hide_secret_values() -> None:
     assert secret not in str(error.value)
 
 
+def test_initial_history_default_and_legacy_configuration_are_capped(settings):
+    assert settings.initial_message_limit == 100
+    values = {**settings.model_dump(), "initial_message_limit": 1000}
+    assert Settings(_env_file=None, **values).initial_message_limit == 100
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

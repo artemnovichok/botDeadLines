@@ -88,6 +88,9 @@ class RetentionService:
                 else:
                     remove = event.completed_at is not None and event.completed_at < cutoff
                 if remove:
+                    if event.recurring_deadline_id is not None:
+                        await session.delete(event)
+                        continue
                     key = event_key(event_data(event))
                     existing = await session.scalar(
                         select(EventTombstone.id).where(

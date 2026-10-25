@@ -11,7 +11,7 @@ from deadline_assistant.db.models import (
     TrackedChat,
 )
 from deadline_assistant.db.session import Database
-from deadline_assistant.domain import EntityNotFound, IntegrationUnavailable, SessionExpired
+from deadline_assistant.domain import EntityNotFound, IntegrationUnavailable, SessionExpired, utcnow
 from deadline_assistant.integrations.telegram import TelegramDialog, TelegramGateway
 from deadline_assistant.repositories.tenant import TenantRepository
 from deadline_assistant.repositories.users import UserRepository
@@ -70,7 +70,7 @@ class AccountService:
                 "Часть чатов недоступна. Обновите список и повторите выбор"
             )
         async with self.database.transaction() as session:
-            await UserRepository(session).require(user_id)
+            user = await UserRepository(session).require(user_id)
             repo = TenantRepository(session, user_id)
             credential = await repo.telegram_session()
             if (
@@ -79,12 +79,19 @@ class AccountService:
                 or credential.encrypted_session_data != encrypted
             ):
                 raise IntegrationUnavailable("Подключение изменилось. Откройте «Мои чаты» заново")
-            for chat in await repo.chats():
+            tracked = await repo.chats()
+            previously_selected = {chat.telegram_chat_id for chat in tracked}
+            for chat in tracked:
                 if chat.telegram_chat_id not in selected:
                     chat.enabled = False
             for chat_id in selected:
                 item = available[chat_id]
-                await repo.track(chat_id, item["title"], item["metadata"])
+                chat = await repo.track(chat_id, item["title"], item["metadata"])
+                if user.initial_analysis_choice is not None and chat_id not in previously_selected:
+                    chat.history_after = utcnow().replace(microsecond=0)
+                    chat.initialization_status = "ready"
+                    chat.last_processed_message_id = 0
+                    chat.initial_upper_message_id = None
         return len(selected)
 
     async def track(self, user_id: UUID, telegram_chat_id: int) -> UUID:
@@ -93,7 +100,7 @@ class AccountService:
         if telegram_chat_id not in available:
             raise EntityNotFound
         async with self.database.transaction() as session:
-            await UserRepository(session).require(user_id)
+            user = await UserRepository(session).require(user_id)
             repo = TenantRepository(session, user_id)
             credential = await repo.telegram_session()
             if (
@@ -103,7 +110,16 @@ class AccountService:
             ):
                 raise IntegrationUnavailable("Подключение аккаунта было отменено")
             selected = available[telegram_chat_id]
+            previously_selected = {c.telegram_chat_id for c in await repo.chats()}
             chat = await repo.track(telegram_chat_id, selected["title"], selected["metadata"])
+            if (
+                user.initial_analysis_choice is not None
+                and telegram_chat_id not in previously_selected
+            ):
+                chat.history_after = utcnow().replace(microsecond=0)
+                chat.initialization_status = "ready"
+                chat.last_processed_message_id = 0
+                chat.initial_upper_message_id = None
             return chat.id
 
     async def untrack(self, user_id: UUID, chat_id: UUID) -> None:

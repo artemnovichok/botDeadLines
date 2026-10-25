@@ -29,7 +29,8 @@ async def test_migrations_upgrade_check_downgrade(tmp_path: Path) -> None:
     engine = create_async_engine(url)
     async with engine.connect() as connection:
         tables = await connection.run_sync(lambda sync: inspect(sync).get_table_names())
-    assert len(tables) == 20  # 19 прикладных таблиц + alembic_version
+    assert len(tables) == 21  # 20 прикладных таблиц + alembic_version
+    assert "recurring_deadlines" in tables
     await engine.dispose()
     await alembic(url, "downgrade", "base")
     await alembic(url, "upgrade", "head")
@@ -40,6 +41,8 @@ async def test_postgresql_migration_sql_compiles() -> None:
     assert "CREATE TABLE users" in sql
     assert "TIMESTAMP WITH TIME ZONE" in sql
     assert "FOREIGN KEY(event_id, user_id)" in sql
+    assert "CREATE TABLE recurring_deadlines" in sql
+    assert "recurring_deadline_id" in sql
 
 
 async def test_second_stage_upgrade_preserves_existing_deadlines_and_session(tmp_path: Path):
@@ -63,6 +66,7 @@ async def test_second_stage_upgrade_preserves_existing_deadlines_and_session(tmp
     from sqlalchemy import text
 
     user_id, event_id, session_id, conflict_id = uuid4(), uuid4(), uuid4(), uuid4()
+    new_user_id = uuid4()
     engine = create_async_engine(url)
     async with engine.begin() as connection:
         await connection.execute(
@@ -72,6 +76,21 @@ async def test_second_stage_upgrade_preserves_existing_deadlines_and_session(tmp
                 "1, '2026-10-20 00:00:00')"
             ),
             {"id": user_id.hex},
+        )
+        await connection.execute(
+            text(
+                "INSERT INTO users (id, telegram_user_id, timezone, preferred_digest_time, "
+                "enabled, created_at) VALUES (:id, 202, 'Europe/Moscow', '08:00:00', "
+                "1, '2026-10-20 00:00:00')"
+            ),
+            {"id": new_user_id.hex},
+        )
+        await connection.execute(
+            text(
+                "INSERT INTO analysis_runs (id, user_id, started_at, status, model, token_usage) "
+                "VALUES (:id, :user, '2026-10-20 00:00:00', 'failed', 'mock', '{}')"
+            ),
+            {"id": uuid4().hex, "user": user_id.hex},
         )
         await connection.execute(
             text(
@@ -108,8 +127,15 @@ async def test_second_stage_upgrade_preserves_existing_deadlines_and_session(tmp
 
             user = await UserRepository(session).require(user_id)
             assert user.study_group is None and user.study_group_prompted_at is None
+            assert user.initial_analysis_choice is True
+            assert user.initial_analysis_decided_at is not None
+            assert (
+                await UserRepository(session).require(new_user_id)
+            ).initial_analysis_choice is None
             await UserRepository(session).set_study_group(user_id, "БПИ267")
-            assert (await repo.event(event_id)).title == "Сохранён до обновления"
+            event = await repo.event(event_id)
+            assert event.title == "Сохранён до обновления"
+            assert event.recurring_deadline_id is None
             assert (await repo.conflict(conflict_id)).event_version == 0
             assert (
                 await repo.telegram_session()

@@ -11,7 +11,7 @@ from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
-from aiogram.types import CallbackQuery, ErrorEvent, Message, TelegramObject
+from aiogram.types import CallbackQuery, ErrorEvent, LinkPreviewOptions, Message, TelegramObject
 from pydantic import ValidationError
 
 from deadline_assistant.db.models import CallbackReceipt, EventList, User
@@ -24,7 +24,15 @@ from deadline_assistant.domain import (
     normalize_study_group,
     utcnow,
 )
-from deadline_assistant.handlers.menus import CONNECT_MENU, MenuStates, create_menu_router
+from deadline_assistant.handlers.menus import (
+    CANCEL,
+    CONNECT_MENU,
+    MENU,
+    MenuStates,
+    ask_study_group,
+    create_menu_router,
+    offer_first_analysis,
+)
 from deadline_assistant.repositories.tenant import TenantRepository
 from deadline_assistant.repositories.users import UserRepository
 from deadline_assistant.services.digest import ConflictCard, build_digest
@@ -35,33 +43,6 @@ if TYPE_CHECKING:
     from deadline_assistant.runtime import Runtime
 
 log = structlog.get_logger()
-HELP = """Deadline Assistant — учебные дедлайны из ваших чатов.
-
-/connect — подключить Telegram по QR или с одного телефона
-/chats — выбор чатов кнопками, поиск и страницы
-/track TELEGRAM_CHAT_ID — отслеживать чат из списка
-/tracked — отслеживаемые чаты и их ID
-/untrack ID — отключить отслеживание
-/sync — запустить анализ в фоне
-/stop_sync — остановить фоновый анализ; сохранённые события останутся
-/events — активные события
-/refresh — обновить сводку из БД без нового анализа
-/status — последний анализ и его время
-/sources ID — источники события
-/done ID — завершить событие
-/correct ID текст — сразу проанализировать и применить исправление
-/undo ID — отменить последнее своё исправление
-/conflicts — ожидающие подтверждения изменения
-/resolve ID номер — выбрать вариант конфликта (0 — оставить неподтверждённым)
-/settings — подключение, пояс, утренняя сводка и последний анализ
-/group — указать или изменить учебную группу, например БПИ267
-/disconnect — отключить аккаунт и отозвать сессию
-/delete_data — полностью удалить личные данные с подтверждением
-/help — эта справка
-
-Сообщения выбранных чатов передаются настроенному провайдеру ИИ.
-Кнопка «Редактировать дедлайн» применяет изменения сразу.
-Отмена многошагового меню: /cancel. Коды и пароли в чат не присылайте."""
 
 
 async def send_chunks(send: Callable[..., Awaitable[Any]], text: str) -> None:
@@ -110,13 +91,14 @@ class BotNotifier:
 
         parts = telegram_chunks(text)
         for index, part in enumerate(parts):
-            markup = None
+            markup = MENU if index == len(parts) - 1 else None
             if isinstance(text, HtmlText) and text.list_id and index == len(parts) - 1:
                 markup = keyboard(actions(text.list_id))
             await self._send(
                 telegram_user_id,
                 part,
                 parse_mode="HTML" if isinstance(text, HtmlText) else None,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
                 reply_markup=markup,
             )
 
@@ -157,11 +139,8 @@ class UserMiddleware(BaseMiddleware):
         if isinstance(event, CallbackQuery):
             value = event.data or ""
             return value.startswith(("auth:", "privacy:", "account:")) or value in {
-                "help",
+                "menu:home",
                 "menu:cancel",
-                "settings:timezone",
-                "settings:time",
-                "settings:group",
             }
         if not isinstance(event, Message):
             return False
@@ -171,20 +150,29 @@ class UserMiddleware(BaseMiddleware):
             return command in {
                 "/start",
                 "/connect",
-                "/help",
-                "/settings",
-                "/group",
                 "/stop_sync",
                 "/cancel",
                 "/disconnect",
                 "/delete_data",
                 "/delete_me",
             }
-        if text in {"Подключить аккаунт", "Настройки", "Помощь", "Отмена"}:
+        return text in {"Подключить аккаунт", "Отмена"}
+
+    async def group_optional(self, event: TelegramObject, data: dict[str, Any]) -> bool:
+        if await self.connection_optional(event, data):
             return True
+        if isinstance(event, CallbackQuery):
+            return event.data == "settings:group"
+        if not isinstance(event, Message):
+            return False
+        text = (event.text or "").strip()
+        if text.startswith("/"):
+            return text.split(maxsplit=1)[0].split("@", 1)[0] == "/group"
         if text in {
             "Мои дедлайны",
             "Мои чаты",
+            "Циклические дедлайны",
+            "Настройки",
             "Редактировать дедлайн",
             "Завершить задание",
             "Посмотреть источники",
@@ -199,11 +187,7 @@ class UserMiddleware(BaseMiddleware):
         else:
             return True
         state = data.get("state")
-        return state is not None and await state.get_state() in {
-            MenuStates.timezone.state,
-            MenuStates.digest_time.state,
-            MenuStates.study_group.state,
-        }
+        return state is not None and await state.get_state() == MenuStates.study_group.state
 
     async def __call__(
         self,
@@ -226,6 +210,7 @@ class UserMiddleware(BaseMiddleware):
             return None
         self.limiter.check(f"incoming:{sender.id}", limit=60, seconds=60)
         optional = await self.connection_optional(event, data)
+        group_optional = await self.group_optional(event, data)
         async with self.runtime.database.transaction() as session:
             user = await UserRepository(session).get_or_create(sender.id, self.runtime.settings)
             # Serializes callback claims across concurrent PostgreSQL transactions as well.
@@ -236,8 +221,14 @@ class UserMiddleware(BaseMiddleware):
             needs_connection = not optional and (
                 credential is None or credential.status != "connected"
             )
+            needs_group = (
+                credential is not None
+                and credential.status == "connected"
+                and not user.study_group
+                and not group_optional
+            )
             duplicate = False
-            if isinstance(event, CallbackQuery) and not needs_connection:
+            if isinstance(event, CallbackQuery) and not needs_connection and not needs_group:
                 # Update redelivery and a second press on one-shot actions are separate cases.
                 one_shot = (event.data or "").startswith(
                     (
@@ -247,8 +238,11 @@ class UserMiddleware(BaseMiddleware):
                         "cfcheck:",
                         "auth:",
                         "analysis:first",
+                        "analysis:skip",
                         "untrack:",
                         "account:confirm_disconnect",
+                        "rc:close:",
+                        "rc:stopconfirm:",
                     )
                 ) or (event.data or "").endswith(":save")
                 raw = (
@@ -282,10 +276,18 @@ class UserMiddleware(BaseMiddleware):
             state = data.get("state")
             if state is not None:
                 await state.clear()
-            text = "Сначала подключите аккаунт: /connect"
+            text = "Сначала подключите аккаунт Telegram."
             if isinstance(event, CallbackQuery):
                 await event.answer(text, show_alert=True)
             await message.answer(text, reply_markup=CONNECT_MENU)
+            return None
+        if needs_group:
+            if isinstance(event, CallbackQuery):
+                await event.answer("Сначала укажите учебную группу", show_alert=True)
+            state = data.get("state")
+            if state is not None:
+                await state.clear()
+            await ask_study_group(message, user, self.runtime, state)
             return None
         data["user"] = user
         task = asyncio.current_task()
@@ -328,6 +330,12 @@ def create_dispatcher(runtime: "Runtime") -> Dispatcher:
             ),
         )
 
+    @router.callback_query(F.data == "privacy:ask")
+    async def ask_delete_data(callback: CallbackQuery, user: User, state: FSMContext) -> None:
+        assert isinstance(callback.message, Message)
+        await callback.answer()
+        await delete_data(callback.message, user, state)
+
     @router.callback_query(F.data.startswith("privacy:"))
     async def privacy(callback: CallbackQuery, user: User, state: FSMContext) -> None:
         if callback.data == "privacy:cancel":
@@ -353,20 +361,14 @@ def create_dispatcher(runtime: "Runtime") -> Dispatcher:
                 )
             )
 
-    @router.message(Command("help"))
-    @router.message(F.text == "Помощь")
-    async def help_command(message: Message) -> None:
-        await message.answer(HELP)
-
     @router.message(Command("track"))
     async def track(message: Message, user: User) -> None:
         parts = (message.text or "").split()
         if len(parts) != 2:
             raise ValueError("Используйте /track TELEGRAM_CHAT_ID из /chats")
         chat_id = await runtime.accounts.track(user.id, int(parts[1]))
-        await message.answer(
-            f"Чат отслеживается. ID: {chat_id}\nЗапустите /sync для первого сбора."
-        )
+        await message.answer(f"Чат отслеживается. ID: {chat_id}. Следующий анализ — ночью.")
+        await offer_first_analysis(message, user, runtime)
 
     @router.message(Command("untrack"))
     async def untrack(message: Message, user: User) -> None:
@@ -410,12 +412,21 @@ def create_dispatcher(runtime: "Runtime") -> Dispatcher:
     @router.message(Command("conflicts"))
     async def conflicts(message: Message, user: User) -> None:
         async with runtime.database.transaction() as session:
-            cards, _ = await build_digest(TenantRepository(session, user.id), user.timezone)
+            cards, _ = await build_digest(
+                TenantRepository(session, user.id), user.timezone, include_conflict_cards=True
+            )
         assert runtime.bot is not None
         for card in cards:
             await BotNotifier(runtime.bot).send_conflict(user.telegram_user_id, card)
         if not cards:
-            await message.answer("Нерешённых конфликтов нет.")
+            await message.answer("Нерешённых конфликтов нет.", reply_markup=MENU)
+
+    @router.callback_query(F.data == "digest:conflicts")
+    async def conflicts_callback(callback: CallbackQuery, user: User, state: FSMContext) -> None:
+        assert isinstance(callback.message, Message)
+        await callback.answer()
+        await state.clear()
+        await conflicts(callback.message, user)
 
     @router.message(Command("resolve"))
     async def resolve(message: Message, user: User) -> None:
@@ -451,14 +462,14 @@ def create_dispatcher(runtime: "Runtime") -> Dispatcher:
                         blocked.bot_blocked_at = utcnow()
             return True
         elif isinstance(exception, (ValidationError, ValueError)):
-            text = "Проверьте формат команды и значения. Справка: /help."
+            text = "Проверьте введённые значения и повторите попытку."
         elif isinstance(exception, TimeoutError):
             text = "Превышено время ожидания. Повторите попытку позже."
         else:
             text = "Не удалось выполнить команду. Повторите попытку позже."
         log.warning("Ошибка команды", error_type=type(exception).__name__)
         if event.update.message and event.update.message.chat.type == "private":
-            await event.update.message.answer(text)
+            await event.update.message.answer(text, reply_markup=CANCEL)
         elif event.update.callback_query:
             callback = event.update.callback_query
             if isinstance(callback.message, Message) and callback.message.chat.type == "private":
@@ -466,7 +477,9 @@ def create_dispatcher(runtime: "Runtime") -> Dispatcher:
         return True
 
     from deadline_assistant.handlers.event_actions import create_event_router
+    from deadline_assistant.handlers.recurring import create_recurring_router
 
+    root.include_router(create_recurring_router(runtime))
     root.include_router(create_event_router(runtime))
     root.include_router(router)
     root.include_router(create_menu_router(runtime))

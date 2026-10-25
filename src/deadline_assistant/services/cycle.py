@@ -49,7 +49,9 @@ class CycleService:
                 query = query.where(User.telegram_user_id == telegram_user_id)
             else:
                 query = query.join(TelegramSession, TelegramSession.user_id == User.id).where(
-                    TelegramSession.status == "connected"
+                    TelegramSession.status == "connected",
+                    User.study_group.is_not(None),
+                    User.initial_analysis_choice.is_not(None),
                 )
             users = list(await session.scalars(query.order_by(User.telegram_user_id)))
             if telegram_user_id is not None and not users:

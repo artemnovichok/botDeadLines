@@ -33,7 +33,7 @@ SECTIONS = (
     "📅 НА ЭТОЙ НЕДЕЛЕ",
     "🗓 В ЭТОМ МЕСЯЦЕ",
     "📌 ОСТАЛЬНОЕ",
-    "❔ Ожидают уточнения",
+    "❔ НЕОПРЕДЕЛЁННОСТИ",
 )
 
 
@@ -78,7 +78,10 @@ def group_events(
     sunday = today + timedelta(days=6 - today.weekday())
     groups: list[list[SummaryItem]] = [[] for _ in SECTIONS]
     for event in events:
-        if event.status != "active":
+        recurring = event.recurring_deadline_id is not None
+        if event.status != "active" and not (recurring and event.status == "completed"):
+            continue
+        if recurring and event.due_at is not None and event.due_at < now:
             continue
         data = event_data(event)
         variants = (disputed or {}).get(event.id, [])
@@ -109,7 +112,14 @@ def group_events(
                 point = start if start and start.astimezone(zone).date() > today else now
                 late = True
         day = point.astimezone(zone).date() if point else None
-        if (unknown and not candidates) or day is None or day < today:
+        if (
+            unknown
+            or data.date_precision == "approximate"
+            or data.needs_clarification
+            or variants
+            or day is None
+            or day < today
+        ):
             section = 4
         elif day == today:
             section = 0
@@ -145,7 +155,11 @@ def summary_event(
             chat_title = next(iter(chat_titles))
             if chat_title.casefold() not in title.casefold():
                 title = chat_title + " — " + title
-    lines = [f"{number}. <b>{escaped(title, 500)}</b>"]
+    title_html = escaped(" ".join(title.split()), 220)
+    closed = item.event.recurring_deadline_id is not None and data.status == "completed"
+    if closed:
+        title_html = f"<s>{title_html}</s>"
+    lines = [f"{number}. <b>{title_html}</b>"]
     if data.due_at:
         local = data.due_at.astimezone(zone)
         label = "Основной срок: " if item.late else ""
@@ -173,7 +187,7 @@ def summary_event(
         lines.append(label + when)
     else:
         lines.append("Дата уточняется")
-    if variants or data.needs_clarification:
+    if variants:
         dates = []
         for variant in variants:
             when = "дата уточняется"
@@ -193,17 +207,26 @@ def summary_event(
                     when = "Примерно " + when
             if when not in dates:
                 dates.append(when)
-        if variants and len(dates) == 1:
-            lines.append("⚠️ Есть противоречия в условиях; проверьте карточку конфликта")
+        if len(dates) == 1:
+            lines[1] = escape(dates[0]) + " · условия требуют подтверждения"
         else:
-            lines.append("⚠️ Дата требует подтверждения")
-            lines.extend("Вариант: " + escape(when) for when in dates)
+            lines[1] = "Дата требует подтверждения: " + escaped(" / ".join(dates), 240)
+    elif item.section == 4 and data.description:
+        lines.append(escaped(" ".join(data.description.split()), 120))
+    elif data.needs_clarification and data.date_precision != "approximate":
+        lines[1] += " · требуется уточнение"
+    if closed:
+        lines[1] = f"<s>{lines[1]}</s>"
+    details = []
+    if item.event.recurring_deadline_id is not None:
+        details.append("🔁 Циклический дедлайн" + (" · закрыт" if closed else ""))
     if data.schedule_kind == "expected_release":
-        lines.append("Ожидается выдача задания")
+        details.append("Ожидается выдача задания")
     if data.is_optional:
-        lines.append("Необязательно")
+        details.append("Необязательно")
     if item.late:
-        lines.append("Действует период досдачи" if item.section == 0 else "Предстоит досдача")
+        pending = data.resubmission_start is not None and item.sort_at == data.resubmission_start
+        details.append("Предстоит досдача" if pending else "Действует период досдачи")
     if data.resubmission_start or data.resubmission_end:
         dates = []
         for late_point in (data.resubmission_start, data.resubmission_end):
@@ -215,23 +238,32 @@ def summary_event(
                     russian_date(local.date(), True)
                     + (f", {local:%H:%M}" if data.resubmission_precision != "day" else "")
                 )
-        lines.append("Досдача: " + " — ".join(dates))
+        details.append("Досдача: " + " — ".join(dates))
     for label, text in (
-        ("Условия: ", data.submission_conditions),
-        ("Штрафы: ", data.penalties),
+        ("", data.submission_conditions),
+        ("Штраф: ", data.penalties),
         ("Место: ", data.location or ""),
     ):
-        if text:
-            lines.append(label + escaped(text, 350))
+        if text and item.section != 4:
+            details.append(label + escaped(" ".join(text.split()), 140))
+    if details:
+        lines.append(" · ".join(details))
     link = next(
-        (safe_link(s.source_url) for s in reversed(sources) if safe_link(s.source_url)), None
+        (
+            safe_link(s.source_url)
+            for s in sorted(
+                sources,
+                key=lambda s: (s.available, s.edit_timestamp or s.message_timestamp),
+                reverse=True,
+            )
+            if safe_link(s.source_url)
+        ),
+        None,
     )
     if link:
-        lines.append(f'<a href="{link}">Источник</a>')
+        lines[1] += f' · <a href="{link}">ссылка</a>'
     elif sources:
-        lines.append("Источник сохранён; ссылка недоступна")
-    if any(not s.available for s in sources):
-        lines.append("Один из источников недоступен в Telegram; текст сохранён")
+        lines[1] += " · ссылка недоступна"
     return "\n".join(lines)
 
 
@@ -253,11 +285,9 @@ def render_summary(
         blocks.append("⚠️ " + escape(stale))
     number = 0
     for index, group in enumerate(groups):
-        if index == 4 and not group:
+        if not group:
             continue
         header = SECTIONS[index]
-        if not group:
-            blocks.append(header + "\nНет предстоящих событий")
         for offset, item in enumerate(group):
             number += 1
             block = summary_event(
@@ -268,5 +298,7 @@ def render_summary(
                 disputed.get(item.event.id, []),
             )
             blocks.append((header + "\n\n" if offset == 0 else "") + block)
-    blocks.append("Часовой пояс: " + escape(timezone))
+    if number == 0:
+        blocks.append("Активных учебных событий пока нет.")
+    blocks[0] += " · " + escape(timezone)
     return HtmlText(blocks)
