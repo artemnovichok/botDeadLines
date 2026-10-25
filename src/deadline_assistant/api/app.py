@@ -255,13 +255,14 @@ def create_app(settings: Settings | None = None, runtime: "Runtime | None" = Non
             raise HTTPException(400, str(exc)) from None
 
     @app.get("/api/auth/state")
-    async def state(request: Request) -> dict[str, str]:
+    async def state(request: Request) -> dict[str, str | int | None]:
         link = await authenticate(request)
         pending = runtime.login.pending.get(link.id)
         return {
             "state": runtime.login.state(link),
             "request_tag": link.id.hex[:6].upper(),
             "delivery": pending.delivery if pending else "",
+            "resend_after": runtime.login.resend_after(link),
         }
 
     @app.get("/api/auth/qr.svg")
@@ -296,6 +297,15 @@ def create_app(settings: Settings | None = None, runtime: "Runtime | None" = Non
         link = await authenticate(request, mutate=True)
         try:
             result = await runtime.login.code(link, data.code.get_secret_value())
+        except AuthFlowError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return {"state": result}
+
+    @app.post("/api/auth/resend")
+    async def resend(request: Request) -> dict[str, str]:
+        link = await authenticate(request, mutate=True)
+        try:
+            result = await runtime.login.resend(link)
         except AuthFlowError as exc:
             raise HTTPException(400, str(exc)) from None
         return {"state": result}

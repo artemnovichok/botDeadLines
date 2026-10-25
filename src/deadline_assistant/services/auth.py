@@ -5,12 +5,14 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import timedelta
+from math import ceil
+from time import monotonic
 from typing import Any
 from uuid import UUID
 
 import structlog
 from sqlalchemy import delete, select, update
-from telethon import types
+from telethon import functions, types
 from telethon.errors import (
     FloodWaitError,
     PasswordHashInvalidError,
@@ -155,6 +157,7 @@ class PendingLogin:
     phone: str | None = field(default=None, repr=False)
     phone_code_hash: str | None = field(default=None, repr=False)
     delivery: str = ""
+    resend_at: float | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
@@ -242,28 +245,81 @@ class QRLoginManager:
             try:
                 async with asyncio.timeout(30):
                     sent = await pending.client.send_code_request(phone)
-                    if isinstance(sent, types.auth.SentCodeSuccess):
-                        await self._finish(link.id, pending)
-                    elif isinstance(sent, types.auth.SentCode):
-                        # Варианты, требующие email setup, оплаты или Firebase, не эмулируем.
-                        supported = {
-                            types.auth.SentCodeTypeApp: "Код отправлен в приложение Telegram.",
-                            types.auth.SentCodeTypeSms: "Telegram отправил код по SMS.",
-                            types.auth.SentCodeTypeCall: "Telegram сообщит код голосовым звонком.",
-                            types.auth.SentCodeTypeEmailCode: "Код отправлен на вашу почту входа.",
-                        }
-                        pending.delivery = supported.get(type(sent.type), "")
-                        if not pending.delivery or not sent.phone_code_hash:
-                            raise AuthFlowError(
-                                "Этот способ подтверждения недоступен этому клиенту. "
-                                "Используйте QR со второго устройства или повторите вход позже"
-                            )
-                        pending.phone_code_hash = sent.phone_code_hash
-                        pending.state = "code_required"
-                    else:
-                        raise AuthFlowError(
-                            "Telegram не разрешил вход по коду. Используйте QR-вход"
+                    await self._sent_code(link, pending, sent)
+            except BaseException as exc:
+                await self._abort(pending)
+                self._raise_api_error(exc)
+                raise
+            if pending.state == "connected":
+                await pending.client.disconnect()
+            return pending.state
+
+    async def _sent_code(self, link: AuthLink, pending: PendingLogin, sent: Any) -> None:
+        pending.resend_at = None
+        if isinstance(sent, types.auth.SentCodeSuccess):
+            await self._finish(link.id, pending)
+            return
+        if not isinstance(sent, types.auth.SentCode):
+            raise AuthFlowError("Telegram не разрешил вход по коду. Используйте QR-вход")
+        # Только типы и таймер: ответ целиком содержит секреты входа.
+        log.info(
+            "telegram_login_delivery",
+            delivery_type=type(sent.type).__name__,
+            next_delivery_type=type(sent.next_type).__name__ if sent.next_type else None,
+            wait_seconds=sent.timeout,
+        )
+        # Варианты, требующие email setup, оплаты или Firebase, не эмулируем.
+        supported = {
+            types.auth.SentCodeTypeApp: (
+                "Telegram выбрал доставку в приложение. Откройте служебный чат «Telegram» "
+                "на устройствах, где уже выполнен вход, и проверьте архив. "
+                "Это не чат с Deadline Assistant; SMS при этом не отправляется."
+            ),
+            types.auth.SentCodeTypeSms: "Telegram выбрал доставку кода по SMS.",
+            types.auth.SentCodeTypeCall: "Telegram сообщит код голосовым звонком.",
+            types.auth.SentCodeTypeEmailCode: "Код отправлен на вашу почту входа.",
+        }
+        pending.delivery = supported.get(type(sent.type), "")
+        if not pending.delivery or not sent.phone_code_hash:
+            raise AuthFlowError(
+                "Этот способ подтверждения недоступен этому клиенту. "
+                "Используйте QR со второго устройства или повторите вход позже"
+            )
+        pending.phone_code_hash = sent.phone_code_hash
+        pending.state = "code_required"
+        if isinstance(sent.next_type, (types.auth.CodeTypeSms, types.auth.CodeTypeCall)):
+            pending.resend_at = monotonic() + max(0, sent.timeout or 0)
+
+    def resend_after(self, link: AuthLink) -> int | None:
+        pending = self.pending.get(link.id)
+        if self.state(link) != "code_required" or pending is None or pending.resend_at is None:
+            return None
+        return max(0, ceil(pending.resend_at - monotonic()))
+
+    async def resend(self, link: AuthLink) -> str:
+        pending = self.pending.get(link.id)
+        if pending is None:
+            raise AuthFlowError("Вход прерван. Получите новую ссылку в боте")
+        async with pending.lock:
+            await self._validate(link)
+            wait = self.resend_after(link)
+            if wait is None:
+                raise AuthFlowError(
+                    "Telegram не предложил доступный способ повторной доставки. "
+                    "Отмените вход, получите новую ссылку в боте и используйте QR"
+                )
+            if wait > 0:
+                raise RateLimited(wait)
+            await self._validate(link, attempt=True)
+            try:
+                async with asyncio.timeout(30):
+                    sent = await pending.client(
+                        functions.auth.ResendCodeRequest(
+                            phone_number=pending.phone,
+                            phone_code_hash=pending.phone_code_hash,
                         )
+                    )
+                    await self._sent_code(link, pending, sent)
             except BaseException as exc:
                 await self._abort(pending)
                 self._raise_api_error(exc)
@@ -288,6 +344,7 @@ class QRLoginManager:
                     await self._finish(link.id, pending)
             except SessionPasswordNeededError:
                 pending.phone_code_hash = None
+                pending.resend_at = None
                 pending.state = "password_required"
             except PhoneCodeInvalidError:
                 if current.attempt_count >= 5:
@@ -343,6 +400,8 @@ class QRLoginManager:
 
     @staticmethod
     def _raise_api_error(exc: BaseException) -> None:
+        if isinstance(exc, (RPCError, OSError, TimeoutError)):
+            log.warning("telegram_login_error", error_type=type(exc).__name__)
         if isinstance(exc, FloodWaitError):
             raise RateLimited(exc.seconds) from None
         if isinstance(exc, PhoneNumberInvalidError):
@@ -390,6 +449,7 @@ class QRLoginManager:
                 link.completed_at = utcnow()
             revoke = False
             pending.phone = pending.phone_code_hash = None
+            pending.resend_at = None
             pending.state = "connected"
             task = asyncio.create_task(self._after_connected(user, previous, encrypted))
             self.finalizers.add(task)
@@ -454,6 +514,7 @@ class QRLoginManager:
     async def _abort(self, pending: PendingLogin) -> None:
         pending.state = "failed"
         pending.phone = pending.phone_code_hash = None
+        pending.resend_at = None
         with suppress(Exception):
             async with asyncio.timeout(5):
                 await pending.client.log_out()

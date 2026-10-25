@@ -45,6 +45,8 @@
     <input id="code" type="password" inputmode="numeric" autocomplete="off"
       pattern="[0-9]{4,10}" required minlength="4" maxlength="10">
     <button type="submit">Продолжить</button>
+    <button id="resend" class="secondary" type="button" hidden>Код не пришёл — запросить ещё раз</button>
+    <p id="resend-help"></p>
   </form>
   <form id="password-form" hidden>
     <label for="password">Пароль двухэтапной аутентификации Telegram</label>

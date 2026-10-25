@@ -1,7 +1,7 @@
 "use strict";
 const byId = id => document.getElementById(id);
 const statusNode = byId("status");
-let timer, currentState = "", phoneChosen = false, busy = false;
+let timer, currentState = "", phoneChosen = false, busy = false, resendAfter = null;
 const terminal = ["connected", "wrong_account", "expired", "failed", "cancelled"];
 const messages = {
   approval_required: "Ожидаем подтверждения в личном чате с ботом.",
@@ -30,11 +30,23 @@ async function api(path, body) {
   }
   return result;
 }
+function showResend() {
+  const available = currentState === "code_required" && resendAfter !== null;
+  byId("resend").hidden = !available;
+  byId("resend").disabled = busy || !available || resendAfter > 0;
+  byId("resend-help").textContent = currentState !== "code_required" ? "" : !available
+    ? "Повторный запрос для этого входа недоступен. Если код не пришёл, отмените вход и получите новую ссылку в боте для входа по QR со второго устройства."
+    : resendAfter > 0
+      ? `Повторный запрос будет доступен через ${resendAfter} с. Автоматически код не запрашивается.`
+      : "Можно запросить следующий способ подтверждения, разрешённый Telegram. Доставка кода не гарантируется.";
+}
 function show(result) {
   const state = result.state;
   if (state !== currentState) statusNode.textContent = messages[state] || "Проверяем подключение…";
   if (state === "waiting" && currentState !== state) byId("qr").src = "/api/auth/qr.svg";
   currentState = state;
+  resendAfter = result.resend_after ?? null;
+  showResend();
   byId("approval").hidden = state !== "approval_required";
   byId("request-tag").textContent = result.request_tag || "";
   byId("methods").hidden = state !== "idle" || phoneChosen;
@@ -76,12 +88,16 @@ async function submit(path, body) {
   } finally {
     busy = false;
     for (const button of document.querySelectorAll("button")) button.disabled = false;
+    showResend();
     if (!terminal.includes(currentState)) timer = setTimeout(refresh, 2000);
   }
 }
 byId("choose-phone").addEventListener("click", () => { phoneChosen = true; show({state: "idle"}); byId("phone").focus(); });
 byId("choose-qr").addEventListener("click", () => submit("qr", {}));
 byId("cancel").addEventListener("click", () => submit("cancel", {}));
+byId("resend").addEventListener("click", () => {
+  if (currentState === "code_required" && resendAfter === 0) submit("resend", {});
+});
 for (const field of ["phone", "code", "password"]) {
   byId(`${field}-form`).addEventListener("submit", event => {
     event.preventDefault();
