@@ -1,0 +1,29 @@
+services:
+  app:
+    build: .
+    init: true
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+    ports:
+      - "127.0.0.1:${PORT:-8000}:8000"
+    volumes:
+      - deadline_data:/app/data
+    restart: unless-stopped
+    stop_grace_period: 660s
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  deadline_data:

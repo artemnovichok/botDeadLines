@@ -1,0 +1,5 @@
+# Замените имя хоста, настройте DNS и PUBLIC_BASE_URL=https://deadline.example.org.
+deadline.example.org {
+    reverse_proxy 127.0.0.1:8000
+    # Access log выключен: URL и параметры авторизации не записываются.
+}

@@ -1,0 +1,47 @@
+# Локальная установка на Mac. start.command задаёт LOCAL_* автоматически.
+# PUBLIC_BASE_URL переопределяется здесь; секреты берутся из существующего .env.
+services:
+  app:
+    build: .
+    init: true
+    user: "${LOCAL_UID:?}:${LOCAL_GID:?}"
+    env_file: .env
+    environment:
+      APP_ENV: development
+      HOST: 0.0.0.0
+      PORT: 8000
+      PUBLIC_BASE_URL: https://localhost:8443
+      DATABASE_URL: "sqlite+aiosqlite:///${LOCAL_DATA_DIR:?}/deadline.db"
+      TLS_CERT_FILE: "${LOCAL_DATA_DIR}/local-tls/localhost.crt"
+      TLS_KEY_FILE: "${LOCAL_DATA_DIR}/local-tls/localhost.key"
+      # При прямом TLS reverse proxy не участвует, forwarded-заголовки не доверены.
+      FORWARDED_ALLOW_IPS: ""
+    ports:
+      - "127.0.0.1:8443:8000"
+    volumes:
+      # Одинаковый абсолютный путь сохраняет координацию SQLite с локальным CLI.
+      - "${LOCAL_DATA_DIR}:${LOCAL_DATA_DIR}"
+    restart: unless-stopped
+    stop_grace_period: 660s
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os, ssl, urllib.request; urllib.request.urlopen('https://localhost:8000/health/ready', timeout=3, context=ssl.create_default_context(cafile=os.environ['TLS_CERT_FILE']))"
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 6
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

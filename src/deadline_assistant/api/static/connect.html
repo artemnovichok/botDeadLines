@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Подключение Telegram — Deadline Assistant</title>
+  <link rel="stylesheet" href="/static/connect.css">
+  <script src="/static/connect.js" defer></script>
+</head>
+<body><main>
+  <p class="brand">Deadline Assistant · подключение аккаунта</p>
+  <h1>Подключите учебные чаты</h1>
+  <p>Вы подключаете Telegram к Deadline Assistant. Сервис сможет читать выбранные вами
+    чаты от имени вашего аккаунта и передавать их сообщения настроенному провайдеру ИИ.
+    Выбор чатов появится в личном чате с ботом после входа.</p>
+  <p id="status" role="status" aria-live="polite">Проверяем ссылку…</p>
+  <section id="approval" hidden>
+    <h2>Подтвердите открытие страницы</h2>
+    <p>Вернитесь в личный чат с ботом. Сравните номер заявки <strong id="request-tag"></strong>
+      с сообщением бота и нажмите «Это я». Затем вернитесь сюда.</p>
+  </section>
+  <section id="methods" hidden>
+    <h2>Выберите способ входа</h2>
+    <button id="choose-phone" type="button">Я с одного телефона</button>
+    <button id="choose-qr" class="secondary" type="button">У меня есть второе устройство — QR</button>
+  </section>
+  <section id="qr-panel" hidden>
+    <p>На другом устройстве откройте Telegram → Настройки → Устройства → Подключить устройство.
+      Отсканируйте QR и подтвердите вход средствами Telegram. QR действует недолго.</p>
+    <img id="qr" width="280" height="280" alt="QR-код для подключения Telegram">
+  </section>
+  <form id="phone-form" hidden>
+    <h2>Вход с одного телефона</h2>
+    <p>Автоматический вход по ссылке на этом телефоне недоступен. Укажите номер,
+      затем переключитесь в Telegram, чтобы получить код или выполнить доступное подтверждение.
+      Вернитесь на эту страницу. Telegram определяет способ доставки; SMS не гарантируется.</p>
+    <label for="phone">Номер Telegram в международном формате</label>
+    <input id="phone" type="tel" inputmode="tel" autocomplete="off" placeholder="+79991234567"
+      pattern="\+[1-9][0-9]{6,14}" required maxlength="16">
+    <button type="submit">Запросить вход через Telegram</button>
+  </form>
+  <form id="code-form" hidden>
+    <label for="code">Код, отправленный Telegram</label>
+    <p id="delivery"></p>
+    <input id="code" type="password" inputmode="numeric" autocomplete="off"
+      pattern="[0-9]{4,10}" required minlength="4" maxlength="10">
+    <button type="submit">Продолжить</button>
+  </form>
+  <form id="password-form" hidden>
+    <label for="password">Пароль двухэтапной аутентификации Telegram</label>
+    <input id="password" type="password" autocomplete="off" required maxlength="1024">
+    <button type="submit">Подтвердить подключение</button>
+  </form>
+  <button id="cancel" class="secondary" type="button" hidden>Отменить авторизацию</button>
+  <p class="note">Это страница Deadline Assistant. Она использует Telethon и официальный протокол Telegram,
+    без Telegram Login Widget. Используйте тот же аккаунт, с которого открыли бота.
+    Не отправляйте коды, пароль 2FA или другие секреты в чат. Ссылка одноразовая, действует 10 минут.
+    Доступ можно отозвать в боте или в Telegram → Настройки → Устройства.</p>
+</main></body></html>
